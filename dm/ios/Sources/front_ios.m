@@ -47,7 +47,10 @@ static UILabel *front_ios_fps_label(void);
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
 @property (nonatomic) BOOL launched;
+@property (nonatomic, strong) CADisplayLink *rateLink;
+@property (nonatomic) double rateApplied;
 - (void)startGame;
+- (void)rateTick:(CADisplayLink *)link;
 @end
 static DmRootVC *g_root;
 static void launcher_done(void) { [g_root startGame]; }
@@ -56,6 +59,15 @@ static void launcher_done(void) { [g_root startGame]; }
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.blackColor;
     front_ios_power_watch();
+    // ProMotion hint: let the panel settle at the game's frame target (DM_FPS_TARGET,
+    // set by the launcher / env files) instead of always running at its maximum rate.
+    // Present pacing is time-based in the host (acquire waits), so the panel rate
+    // changing under it is safe. The range is re-read on every tick and applied only
+    // when it changes.
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self selector:@selector(rateTick:)];
+    link.preferredFrameRateRange = CAFrameRateRangeMake(24, 120, 60);
+    [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    self.rateLink = link;
     if (!front_ios_boot_ok()) {   // No game files: show a hint and do not start the host
         UILabel *lb = [[UILabel alloc] initWithFrame:CGRectInset(self.view.bounds, 40, 40)];
         lb.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -93,6 +105,23 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+    }
+}
+// Re-reads DM_FPS_TARGET each tick (the launcher setenv's it when Play is pressed) and
+// keeps the panel's rate range around the target: preferred = the target clamped to
+// 24-120, minimum 24 so ProMotion may drop the panel for lower targets, maximum 120.
+// Present pacing in the host is time-based, so a panel-rate change under it is safe.
+- (void)rateTick:(CADisplayLink *)link {
+    double preferred = 60;
+    const char *t = getenv("DM_FPS_TARGET");
+    if (t) {
+        double v = atof(t);
+        if (v >= 24 && v <= 120) preferred = v;
+        else if (v > 0 && v < 24) preferred = 24;
+    }
+    if (preferred != self.rateApplied) {
+        self.rateApplied = preferred;
+        link.preferredFrameRateRange = CAFrameRateRangeMake(24, 120, preferred);
     }
 }
 - (void)viewDidAppear:(BOOL)a {
