@@ -762,7 +762,12 @@ void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
     defer_drain();
     defer_reset();
-    if (!g_warm_started && prepare_on()) shmap_load();   // the first submission: the prepare step (warm_start), before anything of it is encoded
+    if (!g_warm_started && prepare_on()) {   // the first submission: the prepare step (warm_start), before anything of it is encoded
+        // It loads shaders and builds pipelines and submits no GPU work, so it runs outside the graphics gate the submission holds (hle_nvn.c gfx_enter): going to the
+        // background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start, with the main thread blocked. Back in, the submission waits
+        // for the foreground like any other
+        dm_gfx_leave(); shmap_load(); dm_gfx_enter();
+    }
     warm_claim();
     if (g_cb) MDIE("submit re-entered");
     g_sub_thread = pthread_self(); atomic_store(&g_sub_thread_set, 1);
