@@ -41,7 +41,10 @@ static void checkSize(DmRootVC *root, CGSize size) {
     check([prefix stringByAppendingString:@" retains the complete picture"], CGRectContainsRect(root.view.bounds, frame));
     check([prefix stringByAppendingString:@" uses the rendering scene scale"], value.scale == root.game.window.windowScene.screen.nativeScale);
     check([prefix stringByAppendingString:@" publishes the actual drawable size"], value.width == layer.drawableSize.width && value.height == layer.drawableSize.height);
-    check([prefix stringByAppendingString:@" converts points to physical pixels"], fabs(value.width - frame.size.width * value.scale) < 0.001 && fabs(value.height - frame.size.height * value.scale) < 0.001);
+    check([prefix stringByAppendingString:@" rounds physical pixels to the nearest whole pixel"],
+        fabs(value.width - frame.size.width * value.scale) <= 0.500001 &&
+        fabs(value.height - frame.size.height * value.scale) <= 0.500001 &&
+        value.width == round(value.width) && value.height == round(value.height));
 }
 
 @interface MetricsScene : SceneDelegate
@@ -74,7 +77,7 @@ static void checkSize(DmRootVC *root, CGSize size) {
         check(@"the default dynamic range stays standard", [layer.preferredDynamicRange isEqual:CADynamicRangeStandard]);
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         check(@"the real scene produces a drawable", drawable != nil);
-        check(@"drawable pixels match the snapshot", drawable && fabs((double)drawable.texture.width - metrics.width) < 1 && fabs((double)drawable.texture.height - metrics.height) < 1);
+        check(@"drawable pixels exactly match the snapshot", drawable && drawable.texture.width == metrics.width && drawable.texture.height == metrics.height);
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             int fps = front_screen_max_fps();
             dispatch_async(dispatch_get_main_queue(), ^{
