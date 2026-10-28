@@ -49,8 +49,14 @@ class Pairs(unittest.TestCase):
 
     def test_stamp_matches_the_hosts_format(self):
         text = b'a\tb\n' + b'c\td\n'
-        self.assertEqual(po.stamp(CHAIN, False, text), f'chain\t{CHAIN}\ndepth\tnear=-w\npairs\t8\t{hashlib.sha256(text).hexdigest()[:16]}\n')
+        h = hashlib.sha256(b'a\tb\nc\td').hexdigest()[:16]   # the parsed lines, sorted, joined by newlines
+        self.assertEqual(po.stamp(CHAIN, False, text), f'chain\t{CHAIN}\ndepth\tnear=-w\npairs\t2\t{h}\n')
         self.assertIn('depth\tnear=0\n', po.stamp(CHAIN, True, text))
+
+    def test_stamp_ignores_comments_order_and_repeats(self):   # the generators rewrite their header comments every build; the archive must survive that
+        text = b'a\tb\nc\td\n'
+        self.assertEqual(po.stamp(CHAIN, False, b'# made 2026-10-28\nc\td\n\na\tb\nc\td\n'), po.stamp(CHAIN, False, text))
+        self.assertNotEqual(po.stamp(CHAIN, False, b'a\tb\nc\te\n'), po.stamp(CHAIN, False, text))
 
     def test_pair_text_joins_the_lists_and_skips_a_missing_one(self):
         with tempfile.TemporaryDirectory() as t:

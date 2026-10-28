@@ -57,7 +57,7 @@ def stamp(chain, zero, text):
     between builds without the pairs changing, and the raw-text hash threw the whole archive away on every reinstall —
     the shader caches' #467 bug, in the prebuild's stamp"""
     seen, lines = set(), []
-    for line in text.split('\n'):
+    for line in text.decode('utf-8').split('\n'):
         if not line or line.startswith('#') or line in seen: continue
         seen.add(line)
         c = line.split('\t')
