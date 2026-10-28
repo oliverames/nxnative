@@ -52,8 +52,18 @@ def read_pairs(text):
 
 
 def stamp(chain, zero, text):
-    """The host's prebuild stamp (pso_prebuild in nvn_mtl.m): chain version, depth mode, and the pair lists' length in bytes and SHA-256 (first 16 hex digits)"""
-    return f'chain\t{chain}\ndepth\t{"near=0" if zero else "near=-w"}\npairs\t{len(text)}\t{hashlib.sha256(text).hexdigest()[:16]}\n'
+    """The host's prebuild stamp (pso_prebuild in nvn_mtl.m): chain version, depth mode, and a hash of the parsed pair
+    lines (blank lines, comments and repeats stripped, the rest sorted). The generators' comment and header lines change
+    between builds without the pairs changing, and the raw-text hash threw the whole archive away on every reinstall —
+    the shader caches' #467 bug, in the prebuild's stamp"""
+    seen, lines = set(), []
+    for line in text.split('\n'):
+        if not line or line.startswith('#') or line in seen: continue
+        seen.add(line)
+        c = line.split('\t')
+        if len(c) >= 2: lines.append(line)
+    canon = '\n'.join(sorted(lines))
+    return f'chain\t{chain}\ndepth\t{"near=0" if zero else "near=-w"}\npairs\t{len(lines)}\t{hashlib.sha256(canon.encode()).hexdigest()[:16]}\n'
 
 
 def functions(path):

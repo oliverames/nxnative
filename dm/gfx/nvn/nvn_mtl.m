@@ -5618,11 +5618,20 @@ static void pre_pair(NSString *vk, NSString *fk, int zero) {
         }
     }
 }
-// What a prebuild covers (prebuilt.tsv): the chain version, the depth mode, and the pair lists' length in bytes and SHA-256 (first 16 hex digits). dm/gfx/tools/pso_offline.py writes
-// the same for the archive it makes offline, from the same files
+// What a prebuild covers (prebuilt.tsv): the chain version, the depth mode, and a hash of the PARSED pair lines (blank lines,
+// comments and repeats stripped, the rest sorted). The generators' comment and header lines change between builds without the
+// pairs changing, and hashing the raw text threw the whole archive away on every reinstall — a full re-grind per game per
+// rebuild (the shader caches had the same bug; #467 fixed it there). dm/gfx/tools/pso_offline.py writes the same for the
+// archive it makes offline, from the same files.
+static NSArray<NSArray<NSString *> *> *pre_parse(NSString *txt);
 static NSString *pre_stamp(NSString *txt, int zero) {
-    NSData *d = [txt dataUsingEncoding:NSUTF8StringEncoding]; uint8_t h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
-    return [NSString stringWithFormat:@"chain\t%s\ndepth\t%s\npairs\t%lu\t%02x%02x%02x%02x%02x%02x%02x%02x\n", DMSH_CHAIN, zero ? "near=0" : "near=-w", (unsigned long)d.length,
+    NSArray<NSArray<NSString *> *> *pairs = pre_parse(txt);
+    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithCapacity:pairs.count];
+    for (NSArray *c in pairs) [lines addObject:[c componentsJoinedByString:@"\t"]];
+    NSArray<NSString *> *sorted = [lines sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { return [a compare:b]; }];
+    NSString *canon = [sorted componentsJoinedByString:@"\n"];
+    NSData *d = [canon dataUsingEncoding:NSUTF8StringEncoding]; uint8_t h[CC_SHA256_DIGEST_LENGTH]; CC_SHA256(d.bytes, (CC_LONG)d.length, h);
+    return [NSString stringWithFormat:@"chain\t%s\ndepth\t%s\npairs\t%lu\t%02x%02x%02x%02x%02x%02x%02x%02x\n", DMSH_CHAIN, zero ? "near=0" : "near=-w", (unsigned long)sorted.count,
             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]];
 }
 static NSArray<NSArray<NSString *> *> *pre_parse(NSString *txt) {   // (vertex key, pixel key) per line, without empty lines, comments and repeated lines
