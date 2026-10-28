@@ -89,8 +89,12 @@ static CGRect fit_16_9(CGRect b) {   // the largest centered 16:9 rectangle in b
         scale = MIN(scale, 1920.0 / MAX(f.size.width, 1));
     }
     l.contentsScale = scale;
-    CGSize pixels = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
+    // A fitted view can have fractional points. CAMetalLayer normalizes its
+    // drawable to whole pixels, so choose that size once and publish the actual
+    // post-set value rather than repeatedly requesting a fractional size.
+    CGSize pixels = CGSizeMake(round(self.bounds.size.width * l.contentsScale), round(self.bounds.size.height * l.contentsScale));
     if (!CGSizeEqualToSize(l.drawableSize, pixels)) l.drawableSize = pixels;
+    pixels = l.drawableSize;
     DmDisplayMetrics value = {l.contentsScale, pixels.width, pixels.height, screen.currentEDRHeadroom,
         screen.potentialEDRHeadroom, (int)screen.maximumFramesPerSecond,
         self.traitCollection.hdrHeadroomUsageLimit == UIHDRHeadroomUsageLimitActive};
