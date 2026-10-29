@@ -47,6 +47,17 @@ static void checkMove(NSString *name) {
     g_boot_ok = 0;
     [super scene:scene willConnectToSession:session options:options];
     DmRootVC *root = (DmRootVC *)self.window.rootViewController; root.launched = YES;
+    // The production no-game-files branch prevents guest startup for this probe.
+    // Replace its placeholder before the first frame so this app cannot look like
+    // a broken game installation. The production missing-files message is intact.
+    for (UIView *view in root.view.subviews.copy) [view removeFromSuperview];
+    UILabel *status = [[UILabel alloc] initWithFrame:root.view.bounds];
+    status.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    status.numberOfLines = 0; status.textAlignment = NSTextAlignmentCenter;
+    status.font = [UIFont systemFontOfSize:20 weight:UIFontWeightMedium];
+    status.textColor = UIColor.whiteColor; status.backgroundColor = UIColor.blackColor;
+    status.text = @"External display test\nRunning programmatic checks.\nThis verification app does not use game files.";
+    [root.view addSubview:status];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         checks = [NSMutableArray array]; trace = [NSMutableArray array];
         UIWindowScene *phone = (UIWindowScene *)scene;
@@ -103,9 +114,12 @@ static void checkMove(NSString *name) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
             check(@"all scene changes started only one guest runtime", atomic_load(&guest_starts) == 1);
             NSInteger failed = 0; for (NSDictionary *item in checks) if (![item[@"passed"] boolValue]) failed++;
+            status.text = [NSString stringWithFormat:@"External display test\n%@: %lu checks, %ld failed.\nThis verification app does not use game files.\nPhysical external-display testing is still pending.",
+                failed ? @"FAILED" : @"PASS", (unsigned long)checks.count, (long)failed];
+            [root.view bringSubviewToFront:status];
             NSURL *provenanceURL = [NSBundle.mainBundle URLForResource:@"SourceProvenance" withExtension:@"json"];
             NSDictionary *provenance = [NSJSONSerialization JSONObjectWithData:[NSData dataWithContentsOfURL:provenanceURL] options:0 error:NULL];
-            NSDictionary *report = @{@"sourceProvenance":provenance, @"checks":checks, @"failed":@(failed), @"guestStarts":@(atomic_load(&guest_starts)),
+            NSDictionary *report = @{@"displayMessage":status.text, @"sourceProvenance":provenance, @"checks":checks, @"failed":@(failed), @"guestStarts":@(atomic_load(&guest_starts)),
                 @"physicalExternalDisplayTested":@NO, @"outputWindowsSharePhoneScene":@YES,
                 @"externalSceneIdentitiesInjected":@YES, @"graphicsGateAndDisplayLinkStubbed":@YES,
                 @"systemVersion":UIDevice.currentDevice.systemVersion};

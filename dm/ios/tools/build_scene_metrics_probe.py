@@ -49,7 +49,7 @@ def main():
                 'HEADER_SEARCH_PATHS': [str(REPO / 'dm/host'), str(REPO / 'dm/ios/Sources'), str(include)],
             }},
             'info': {'path': 'Info.plist', 'properties': {
-                'CFBundleDisplayName': 'Display Verification', 'UILaunchScreen': {},
+                'CFBundleDisplayName': 'External Display Test' if args.external_scenes else 'Display Verification', 'UILaunchScreen': {},
                 'UIFileSharingEnabled': True,
                 'UISupportedInterfaceOrientations': ['UIInterfaceOrientationLandscapeLeft', 'UIInterfaceOrientationLandscapeRight'],
                 'UIApplicationSceneManifest': {'UIApplicationSupportsMultipleScenes': False,
