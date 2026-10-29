@@ -23,6 +23,21 @@ static void front_ios_power_watch(void);
 static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
 
+// UIKit values belong to the scene rendering this view, not the phone's main
+// screen. Publish one snapshot on the main thread; the present thread only
+// reads the copy (front_screen_max_fps), including while a scene moves displays.
+typedef struct {
+    double scale, width, height, headroom, potential_headroom;
+    int max_fps, headroom_active;
+} DmDisplayMetrics;
+static pthread_mutex_t g_display_mu = PTHREAD_MUTEX_INITIALIZER;
+static DmDisplayMetrics g_display;
+static DmDisplayMetrics display_snapshot(void) {
+    pthread_mutex_lock(&g_display_mu); DmDisplayMetrics value = g_display; pthread_mutex_unlock(&g_display_mu);
+    return value;
+}
+int front_screen_max_fps(void) { return display_snapshot().max_fps; }
+
 @interface DmGameView : UIView
 @end
 @implementation DmGameView
@@ -31,15 +46,46 @@ static UILabel *front_ios_fps_label(void);
     if ((self = [super initWithFrame:f])) {
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        l.contentsScale = UIScreen.mainScreen.nativeScale; l.framebufferOnly = NO; l.opaque = YES;
+        l.framebufferOnly = NO; l.opaque = YES;
         self.backgroundColor = UIColor.blackColor;
+        [self registerForTraitChanges:@[UITraitDisplayScale.class, UITraitHDRHeadroomUsageLimit.class]
+            withHandler:^(DmGameView *view, UITraitCollection *previous) { (void)previous; [view setNeedsLayout]; }];
+        for (NSNotificationName name in @[UIScreenBrightnessDidChangeNotification, UIScreenModeDidChangeNotification])
+            [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(displayChanged:) name:name object:nil];
     }
     return self;
 }
+- (void)didMoveToWindow { [super didMoveToWindow]; [self setNeedsLayout]; }
+- (void)displayChanged:(NSNotification *)notification {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (notification.object == self.window.windowScene.screen) [self setNeedsLayout];
+    });
+}
 - (void)layoutSubviews {
     [super layoutSubviews];
+    UIWindowScene *scene = self.window.windowScene;
+    if (!scene) return;   // No display is selected until the view joins a window.
+    UIScreen *screen = scene.screen;
     CAMetalLayer *l = (CAMetalLayer *)self.layer;
-    l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
+    l.contentsScale = screen.nativeScale;
+    // A fitted view can have fractional points. CAMetalLayer normalizes its
+    // drawable to whole pixels, so choose that size once and publish the actual
+    // post-set value rather than repeatedly requesting a fractional size.
+    CGSize pixels = CGSizeMake(round(self.bounds.size.width * l.contentsScale), round(self.bounds.size.height * l.contentsScale));
+    if (!CGSizeEqualToSize(l.drawableSize, pixels)) l.drawableSize = pixels;
+    pixels = l.drawableSize;
+    DmDisplayMetrics value = {l.contentsScale, pixels.width, pixels.height, screen.currentEDRHeadroom,
+        screen.potentialEDRHeadroom, (int)screen.maximumFramesPerSecond,
+        self.traitCollection.hdrHeadroomUsageLimit == UIHDRHeadroomUsageLimitActive};
+    pthread_mutex_lock(&g_display_mu);
+    DmDisplayMetrics previous = g_display; g_display = value;
+    pthread_mutex_unlock(&g_display_mu);
+    if (value.scale != previous.scale || value.width != previous.width || value.height != previous.height ||
+        value.max_fps != previous.max_fps || value.headroom != previous.headroom ||
+        value.potential_headroom != previous.potential_headroom || value.headroom_active != previous.headroom_active)
+        LOG("display: scene scale %.3f, drawable %.0fx%.0f, maximum %d Hz, EDR headroom %.3f / %.3f (%s); SDR output",
+            value.scale, value.width, value.height, value.max_fps, value.headroom, value.potential_headroom,
+            value.headroom_active ? "active" : "inactive");
 }
 @end
 
@@ -113,6 +159,10 @@ static void launcher_done(void) { [g_root startGame]; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
 UIViewController *front_ios_root(void) { return [DmRootVC new]; }
+void front_ios_scene_changed(UIWindowScene *scene) {
+    if (g_root.game.window.windowScene != scene) return;
+    [g_root.game setNeedsLayout]; [g_root.game layoutIfNeeded];
+}
 
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
