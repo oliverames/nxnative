@@ -2,6 +2,33 @@
 // Only entry points that go to a service are hooked; library functions that only read and write the game's own buffers (prepo Add / Array / Struct, err ErrorResultVariant, friends getters, socket byte-order conversion) keep running in the SDK.
 // Return convention as in hle_friends.c: Result returns RES_FAIL ("saved / submitted" kinds return RES_OK so the game does not retry); bool returns false; events get a bound SystemEvent that never fires.
 #include "hle.h"
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <errno.h>
+
+// Diagnostic only: the first 64 actual LDN hook entries, including on iOS.
+// Do not inspect opaque network/security/user buffers or log peer identities.
+static _Atomic int g_ldn_trace_on = -1;
+static _Atomic unsigned g_ldn_trace_count;
+static void ldn_trace(const char *symbol, const char *format, ...) {
+    int saved_errno = errno, enabled = atomic_load(&g_ldn_trace_on);
+    if (enabled < 0) {
+        const char *e = getenv("DM_LDN_TRACE"); int value = e && !strcmp(e, "1"), unknown = -1;
+        atomic_compare_exchange_strong(&g_ldn_trace_on, &unknown, value); enabled = atomic_load(&g_ldn_trace_on);
+    }
+    if (enabled) {
+        unsigned n = atomic_load(&g_ldn_trace_count);
+        while (n < 64 && !atomic_compare_exchange_weak(&g_ldn_trace_count, &n, n + 1)) {}
+        if (n < 64) {
+            flockfile(stderr);
+            fprintf(stderr, "[dm] ldn trace %u/64 %s", n + 1, symbol);
+            va_list ap; va_start(ap, format); vfprintf(stderr, format, ap); va_end(ap);
+            fputc('\n', stderr); funlockfile(stderr);
+        }
+    }
+    errno = saved_errno;
+}
+#define LDN_TRACE(cname, ...) ldn_trace(hle_force_##cname.name, __VA_ARGS__)
 
 static _Alignas(16) uint8_t g_ev_ldn[0x100];
 
@@ -15,35 +42,35 @@ HLE_FORCE("_ZN2nn5prepo27AddInternetConnectionStatusEPNS0_10PlayReportEPKcS4_S4_
 HLE_FORCE("_ZN2nn5prepo28RequestImmediateTransmissionEv", "telemetry immediate upload; nothing is sent, reports success", Result, h_prepo_Tx, void) { return RES_OK; }
 
 // ---------- ldn: local wireless. Initialization fails, state is always "none" ----------
-HLE_FORCE("_ZN2nn3ldn10InitializeEv", "local wireless (cut): initialization fails", Result, h_ldn_Init, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn8FinalizeEv", "local wireless (cut)", void, h_ldn_Fini, void) {}
-HLE_FORCE("_ZN2nn3ldn8GetStateEv", "local wireless (cut): state 0 (none)", int, h_ldn_State, void) { return 0; }
-HLE_FORCE("_ZN2nn3ldn22AttachStateChangeEventEPNS_2os15SystemEventTypeE", "local wireless state event: bound, never fires", void, h_ldn_Attach, void *ev) { hle_bind_system_event(ev, 0); (void)g_ev_ldn; }
-HLE_FORCE("_ZN2nn3ldn11OpenStationEv", "local wireless (cut)", Result, h_ldn_OpenSta, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn12CloseStationEv", "local wireless (cut)", Result, h_ldn_CloseSta, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn15OpenAccessPointEv", "local wireless (cut)", Result, h_ldn_OpenAp, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn16CloseAccessPointEv", "local wireless (cut)", Result, h_ldn_CloseAp, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn10DisconnectEv", "local wireless (cut)", Result, h_ldn_Disc, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn14DestroyNetworkEv", "local wireless (cut)", Result, h_ldn_Destroy, void) { return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", "local wireless scan (cut): 0 found", Result, h_ldn_Scan, void *out, int *n, int max, const void *f, int ch) { (void)out; (void)max; (void)f; (void)ch; if (n) *n = 0; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", "local wireless scan (cut): 0 found", Result, h_ldn_ScanP, void *out, int *n, int max, const void *f, int ch) { (void)out; (void)max; (void)f; (void)ch; if (n) *n = 0; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn10InitializeEv", "local wireless (cut): initialization fails", Result, h_ldn_Init, void) { LDN_TRACE(h_ldn_Init, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn8FinalizeEv", "local wireless (cut)", void, h_ldn_Fini, void) { LDN_TRACE(h_ldn_Fini, " offline return=void");}
+HLE_FORCE("_ZN2nn3ldn8GetStateEv", "local wireless (cut): state 0 (none)", int, h_ldn_State, void) { LDN_TRACE(h_ldn_State, " offline value=0"); return 0; }
+HLE_FORCE("_ZN2nn3ldn22AttachStateChangeEventEPNS_2os15SystemEventTypeE", "local wireless state event: bound, never fires", void, h_ldn_Attach, void *ev) { LDN_TRACE(h_ldn_Attach, " offline return=void"); hle_bind_system_event(ev, 0); (void)g_ev_ldn; }
+HLE_FORCE("_ZN2nn3ldn11OpenStationEv", "local wireless (cut)", Result, h_ldn_OpenSta, void) { LDN_TRACE(h_ldn_OpenSta, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn12CloseStationEv", "local wireless (cut)", Result, h_ldn_CloseSta, void) { LDN_TRACE(h_ldn_CloseSta, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn15OpenAccessPointEv", "local wireless (cut)", Result, h_ldn_OpenAp, void) { LDN_TRACE(h_ldn_OpenAp, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn16CloseAccessPointEv", "local wireless (cut)", Result, h_ldn_CloseAp, void) { LDN_TRACE(h_ldn_CloseAp, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn10DisconnectEv", "local wireless (cut)", Result, h_ldn_Disc, void) { LDN_TRACE(h_ldn_Disc, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn14DestroyNetworkEv", "local wireless (cut)", Result, h_ldn_Destroy, void) { LDN_TRACE(h_ldn_Destroy, " offline result=%#x", RES_FAIL); return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn4ScanEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", "local wireless scan (cut): 0 found", Result, h_ldn_Scan, void *out, int *n, int max, const void *f, int ch) { LDN_TRACE(h_ldn_Scan, " offline result=%#x capacity=%d output_count=0", RES_FAIL, max); (void)out; (void)max; (void)f; (void)ch; if (n) *n = 0; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn11ScanPrivateEPNS0_11NetworkInfoEPiiRKNS0_10ScanFilterEi", "local wireless scan (cut): 0 found", Result, h_ldn_ScanP, void *out, int *n, int max, const void *f, int ch) { LDN_TRACE(h_ldn_ScanP, " offline result=%#x capacity=%d output_count=0", RES_FAIL, max); (void)out; (void)max; (void)f; (void)ch; if (n) *n = 0; return RES_FAIL; }
 HLE_FORCE("_ZN2nn3ldn13CreateNetworkERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_10UserConfigE", "local wireless (cut)", Result, h_ldn_Create,
-          const void *a, const void *b, const void *c) { (void)a; (void)b; (void)c; return RES_FAIL; }
+          const void *a, const void *b, const void *c) { LDN_TRACE(h_ldn_Create, " offline result=%#x", RES_FAIL); (void)a; (void)b; (void)c; return RES_FAIL; }
 HLE_FORCE("_ZN2nn3ldn20CreateNetworkPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiPKNS0_12AddressEntryE", "local wireless (cut)",
-          Result, h_ldn_CreateP, const void *a, const void *b, const void *c, const void *d, int n, const void *e) { (void)a; (void)b; (void)c; (void)d; (void)n; (void)e; return RES_FAIL; }
+          Result, h_ldn_CreateP, const void *a, const void *b, const void *c, const void *d, int n, const void *e) { LDN_TRACE(h_ldn_CreateP, " offline result=%#x address_count=%d", RES_FAIL, n); (void)a; (void)b; (void)c; (void)d; (void)n; (void)e; return RES_FAIL; }
 HLE_FORCE("_ZN2nn3ldn7ConnectERKNS0_11NetworkInfoERKNS0_14SecurityConfigERKNS0_10UserConfigEiNS0_13ConnectOptionE", "local wireless (cut)", Result, h_ldn_Connect,
-          const void *a, const void *b, const void *c, int v, int o) { (void)a; (void)b; (void)c; (void)v; (void)o; return RES_FAIL; }
+          const void *a, const void *b, const void *c, int v, int o) { LDN_TRACE(h_ldn_Connect, " offline result=%#x", RES_FAIL); (void)a; (void)b; (void)c; (void)v; (void)o; return RES_FAIL; }
 HLE_FORCE("_ZN2nn3ldn14ConnectPrivateERKNS0_13NetworkConfigERKNS0_14SecurityConfigERKNS0_17SecurityParameterERKNS0_10UserConfigEiNS0_13ConnectOptionE", "local wireless (cut)",
-          Result, h_ldn_ConnectP, const void *a, const void *b, const void *c, const void *d, int v, int o) { (void)a; (void)b; (void)c; (void)d; (void)v; (void)o; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE", "local wireless (cut)", Result, h_ldn_NetInfo, void *o) { (void)o; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE", "local wireless (cut)", Result, h_ldn_Ip, uint32_t *a, uint32_t *m) { if (a) *a = 0; if (m) *m = 0; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE", "local wireless (cut)", Result, h_ldn_SecPrm, void *o) { (void)o; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn16SetAdvertiseDataEPKvm", "local wireless (cut)", Result, h_ldn_Adv, const void *d, uint64_t n) { (void)d; (void)n; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn19GetDisconnectReasonEv", "local wireless (cut): 0", int, h_ldn_DiscReason, void) { return 0; }
-HLE_FORCE("_ZN2nn3ldn20AddAcceptFilterEntryENS0_10MacAddressE", "local wireless (cut)", Result, h_ldn_Filter, uint64_t mac) { (void)mac; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE", "local wireless (cut)", Result, h_ldn_Policy, int p) { (void)p; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", "local wireless (cut)", Result, h_ldn_Reject, uint32_t a) { (void)a; return RES_FAIL; }
-HLE_FORCE("_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE", "local wireless (cut)", Result, h_ldn_NetCfg, void *o) { (void)o; return RES_FAIL; }
+          Result, h_ldn_ConnectP, const void *a, const void *b, const void *c, const void *d, int v, int o) { LDN_TRACE(h_ldn_ConnectP, " offline result=%#x", RES_FAIL); (void)a; (void)b; (void)c; (void)d; (void)v; (void)o; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn14GetNetworkInfoEPNS0_11NetworkInfoE", "local wireless (cut)", Result, h_ldn_NetInfo, void *o) { LDN_TRACE(h_ldn_NetInfo, " offline result=%#x", RES_FAIL); (void)o; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn14GetIpv4AddressEPNS0_11Ipv4AddressEPNS0_10SubnetMaskE", "local wireless (cut)", Result, h_ldn_Ip, uint32_t *a, uint32_t *m) { LDN_TRACE(h_ldn_Ip, " offline result=%#x", RES_FAIL); if (a) *a = 0; if (m) *m = 0; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn20GetSecurityParameterEPNS0_17SecurityParameterE", "local wireless (cut)", Result, h_ldn_SecPrm, void *o) { LDN_TRACE(h_ldn_SecPrm, " offline result=%#x", RES_FAIL); (void)o; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn16SetAdvertiseDataEPKvm", "local wireless (cut)", Result, h_ldn_Adv, const void *d, uint64_t n) { LDN_TRACE(h_ldn_Adv, " offline result=%#x byte_count=%llu", RES_FAIL, (unsigned long long)n); (void)d; (void)n; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn19GetDisconnectReasonEv", "local wireless (cut): 0", int, h_ldn_DiscReason, void) { LDN_TRACE(h_ldn_DiscReason, " offline value=0"); return 0; }
+HLE_FORCE("_ZN2nn3ldn20AddAcceptFilterEntryENS0_10MacAddressE", "local wireless (cut)", Result, h_ldn_Filter, uint64_t mac) { LDN_TRACE(h_ldn_Filter, " offline result=%#x", RES_FAIL); (void)mac; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn22SetStationAcceptPolicyENS0_12AcceptPolicyE", "local wireless (cut)", Result, h_ldn_Policy, int p) { LDN_TRACE(h_ldn_Policy, " offline result=%#x", RES_FAIL); (void)p; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn6RejectENS0_11Ipv4AddressE", "local wireless (cut)", Result, h_ldn_Reject, uint32_t a) { LDN_TRACE(h_ldn_Reject, " offline result=%#x", RES_FAIL); (void)a; return RES_FAIL; }
+HLE_FORCE("_ZN2nn3ldn16GetNetworkConfigEPNS0_13NetworkConfigE", "local wireless (cut)", Result, h_ldn_NetCfg, void *o) { LDN_TRACE(h_ldn_NetCfg, " offline result=%#x", RES_FAIL); (void)o; return RES_FAIL; }
 
 // ---------- socket: offline by default (every call -1/ENETDOWN); with DM_NET=1 the calls are the host's own sockets (hle_net.c) ----------
 enum { SK_ENETDOWN = 50, SK_EAI_FAIL = 4 };

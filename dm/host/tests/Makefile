@@ -258,3 +258,12 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	$(B)/t_altstack
 	DM_QOS_MAP=1 $(B)/t_notify_sched
 	DM_QOS_MAP=1 $(B)/t_notify_sched --all-peers
+
+# iOS-compatible LDN entry diagnostics use the same hook registrations as the guest.
+$(B)/t_ldn_trace: t_ldn_trace.c ../hle_offline.c ../hle_net.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_ldn_trace.c ../hle_net.c
+.PHONY: ldn-trace
+ldn-trace: $(B)/t_ldn_trace
+	$(B)/t_ldn_trace
+
+run: ldn-trace
