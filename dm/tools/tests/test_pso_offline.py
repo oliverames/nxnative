@@ -7,6 +7,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import types
 from pathlib import Path
 import shutil
 import struct
@@ -291,6 +293,22 @@ class Default(unittest.TestCase):
                          {k: v.split()[0] + ' g17p' for k, v in {k: p[0].strip() for k, p in r.items()}.items()})
         self.assertEqual(self.gpus(games, DM_PSO_GPUS='none')['0100000000F0F000'][0].strip(), 'on none')
         self.assertEqual(self.gpus(games, DM_PSO_GPUS='')['0100000000F0F000'][0].strip(), 'on')
+
+    def test_nsp_defaults_follow_the_same_profile_gate(self):
+        # Run the NSP script's actual choice block without extracting or building a game.
+        script = (REPO / 'scripts/build_ipa_from_nsp.py').read_text()
+        start = script.index("    gpus = (args.gpu or PSO_GPUS).strip()")
+        end = script.index("    ipa_env['DM_PSO_GPUS'] = gpus", start)
+        block = '\n'.join(line[4:] for line in script[start:end].splitlines())
+        for p4, pg, expected in [('on', '', 'g18p'), ('on', 'g18p   applegpu_g19p', 'g18p,applegpu_g19p'),
+                                 ('off', '', 'none'), ('off', 'g19p', 'none')]:
+            for explicit, setting in [('', ''), ('g17p', ''), ('none', ''), ('', 'g16p')]:
+                with self.subTest(pso_mtl4=p4, pso_gpu=pg, gpu=explicit, setting=setting):
+                    scope = {'args': types.SimpleNamespace(gpu=explicit), 'PSO_GPUS': setting,
+                             'g': types.SimpleNamespace(get={'pso_mtl4': p4, 'pso_gpu': pg}.get),
+                             're': re, 'BuildError': RuntimeError}
+                    exec(block, scope)
+                    self.assertEqual(scope['gpus'], explicit or setting or expected)
 
     def test_breath_of_the_wild(self):   # the profile that turns the Metal 4 path on: its app gets the archive
         r = subprocess.run([sys.executable, str(REPO / 'dm/games/game.py'), '01007EF00011E000', 'pso_mtl4', 'off'], capture_output=True, text=True)
