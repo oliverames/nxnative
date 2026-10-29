@@ -14,6 +14,8 @@ In 3D, the right stick (the camera in most games) is not drawn: swipe on the rig
 
 A connected game controller hides the touch controls and keeps every button.
 
+The optional iOS experiment `DM_PAD_ASSIGN=1` adds a **Players** button for choosing each controller's player. Move a control to identify its row, then choose a player; occupied players swap controllers. Touch controls stay with Player 1 and remain available when only later players have physical controllers. Identical controller models may change order after reconnecting. This option is off by default and is ignored with `DM_PAD_MERGE=1`.
+
 ## Rumble
 
 Game vibration uses the iPhone's haptic engine or a compatible connected controller. Controllers with separate left/right haptic outputs keep those effects separate. The settings screen's **Game rumble** and **Rumble strength** control it independently of **Touch feedback**. Phone rumble approximates the Switch's effects; physical feel and controller compatibility still need device testing.
