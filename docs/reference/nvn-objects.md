@@ -182,7 +182,8 @@ Games read this count as a position in their own command memory and size their h
 
 - **Symptom:** `FATAL submit re-entered` in the first frames.
 - **Cause:** the game initializes two NVN queues and submits on both from two threads, while the Metal replay keeps one command buffer for the submission in progress.
-- **Fix:** `nvnQueueSubmitCommands` now holds a lock across the replay (`g_sub_mu` in `hle_nvn.c`).
+- **Fix:** `nvnQueueSubmitCommands` holds a lock across the replay (`g_sub_mu` in `hle_nvn.c`). It takes that lock before entering the graphics gate: a second submission waiting for the first must not count as in-flight graphics while preparation runs outside the gate. Otherwise background suspension waits for the queued submission, while the first waits to reenter the suspended gate before it can release the replay lock. `dm_host_mutex_lock` still marks a contended wait as host work so the guest scheduler can hand off the emulated core.
+- **Check:** the CPU-only `t_gfx_suspend` drives the real submit entry from two threads, holds its first prepare step outside the gate, suspends with the second queued, and resumes both. It checks that suspension returns, no commands commit in the background, and both submissions complete after resume. The original gate-before-lock order fails before suspension.
 - **Found on:** [Fire Emblem: Three Houses](../../dm/games/010055D009F78000/README.md).
 
 ### A GPU command buffer that never completes
