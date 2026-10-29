@@ -2,6 +2,27 @@
 
 The audio renderer (`dm/host/hle_audren.c`), AudioOut, audio devices and codecs. Each entry: symptom, cause, fix, the games it was found on. The [symptom index](../agents/symptoms.md) lists every symptom.
 
+## iOS audio session
+
+### Experimental route recovery
+
+- **Symptom:** an iOS session whose activation failed can stay silent while the
+  game remains foreground, even after an audio route becomes available. The
+  current retry requires another foreground/active transition.
+- **Cause:** the front end observes interruptions and media-service resets but
+  not route changes. A route change alone cannot retry the failed session.
+- **Experiment:** `DM_IOS_AUDIO_ROUTE_RECOVERY=1` logs the actual route, sample
+  rate and buffer duration. Recognized device/route events retry a failed session
+  only while foreground and uninterrupted. After successful activation, outputs
+  are recreated to leave a silent fallback. Healthy routes keep RemoteIO's own
+  handling. Category-change notifications are excluded to avoid recursion from
+  our own session setup. Default off; no polling or activation retry timer.
+- **Found on:** the activation failure was recorded during the Duo/CarPlay
+  session. Recovery through actual CarPlay/headphone changes is still unverified;
+  this experiment does not establish the cause of progressive audio glitches.
+- **Check:** `make -C dm/host/tests ios-audio-route` runs the actual event policy
+  without audio hardware. Native compilation and physical route tests are separate.
+
 ## Audio renderer
 
 ### Running the SDK's own renderer on the CPU
