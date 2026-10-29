@@ -252,3 +252,12 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	$(B)/t_altstack
 	DM_QOS_MAP=1 $(B)/t_notify_sched
 	DM_QOS_MAP=1 $(B)/t_notify_sched --all-peers
+
+# Guest query tracing plus the existing VI geometry/crop boundary; no game data or GPU.
+$(B)/t_aspect_trace: t_aspect_trace.c ../hle_oe.c ../../gfx/hle_vi.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_aspect_trace.c
+.PHONY: aspect-trace
+aspect-trace: $(B)/t_aspect_trace
+	$(B)/t_aspect_trace
+
+run: aspect-trace

@@ -5,6 +5,7 @@
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
+#include <errno.h>
 static _Atomic int g_opmode = -1;
 int dm_opmode(void) {
     int m = g_opmode;
@@ -131,11 +132,33 @@ HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "performance mode query; same as th
 static unsigned char g_cpu_oc;
 HLE_FORCE("_ZN2nn2oe21IsCpuOverclockEnabledEv", "CPU overclock state (through apm): what SetCpuOverclockEnabled set, off at start", unsigned, h_oe_CpuOc, void) { return g_cpu_oc; }
 HLE_FORCE("_ZN2nn2oe22SetCpuOverclockEnabledEb", "CPU overclock switch (through apm); the host does not scale clocks", void, h_oe_SetCpuOc, unsigned on) { g_cpu_oc = on & 0xff; }
+// This query is not every game's source of camera dimensions. Record actual
+// callers before trying a resolution override; keep the stock Switch answer.
+static _Atomic int g_aspect_trace_on = -1;
+static _Atomic unsigned g_aspect_trace_count;
+static void aspect_query_trace(const char *symbol, int width, int height) {
+    int saved_errno = errno, enabled = atomic_load(&g_aspect_trace_on);
+    if (enabled < 0) {
+        const char *e = getenv("DM_ASPECT_TRACE"); int value = e && !strcmp(e, "1"), unknown = -1;
+        atomic_compare_exchange_strong(&g_aspect_trace_on, &unknown, value); enabled = atomic_load(&g_aspect_trace_on);
+    }
+    if (enabled) {
+        unsigned n = atomic_load(&g_aspect_trace_count);
+        while (n < 16 && !atomic_compare_exchange_weak(&g_aspect_trace_count, &n, n + 1)) {}
+        if (n < 16) {
+            if (width && height) LOG("aspect query %u/16 %s answer=%dx%d (stock; no camera override)", n + 1, symbol, width, height);
+            else LOG("aspect query %u/16 %s change_event_request (stock binding)", n + 1, symbol);
+        }
+    }
+    errno = saved_errno;
+}
 HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
-    int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
+    int con = opmode() == 1, width = con ? 1920 : 1280, height = con ? 1080 : 720;
+    if (w) *w = width; if (h) *h = height;
+    aspect_query_trace(hle_force_h_oe_DefRes.name, width, height);
 }
 HLE_FORCE("_ZN2nn2oe38GetDefaultDisplayResolutionChangeEventEPNS_2os11SystemEventE", "default display resolution change event: bound, never signaled (the operation mode notification carries the change)",
-          void, h_oe_DefResEv, void *ev) { hle_bind_system_event(ev, 0); }
+          void, h_oe_DefResEv, void *ev) { aspect_query_trace(hle_force_h_oe_DefResEv.name, 0, 0); hle_bind_system_event(ev, 0); }
 HLE_FORCE("_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_", "server maintenance overlay (through am); the host has no system overlay", void, h_oe_MaintOverlay, int64_t a, int64_t b) { (void)a; (void)b; }
 // apm performance configurations: Normal 0x00010000 (CPU 1020 / GPU 384 / EMC 1600 MHz, the handheld default), Boost 0x00010001 (GPU 768 MHz, the docked default)
 HLE_FORCE("_ZN2nn2oe27GetPerformanceConfigurationENS0_15PerformanceModeE", "query the CPU/GPU clock config (through apm); reports the default for the mode", int, h_oe_GetPerfCfg, int mode) { return mode == 1 ? 0x00010001 : 0x00010000; }
