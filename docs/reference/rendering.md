@@ -34,6 +34,15 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Note:** Metal makes a swizzled view read-only (usage 0x1), so an image slot gets the same view without the mapping (`img_fit`), and the on-chip read merge leaves a swizzled sample alone.
 - **Found on:** [Super Mario Bros. Wonder](../../dm/games/010015100B514000/README.md) (the font atlas); The Legend of Zelda: Echoes of Wisdom's hearts (GitHub PR #66, the RGB565 red / blue swap).
 
+### A plain texture's initial fill in Metal's channel order
+
+- **Symptom:** RGB565, RGB5A1 or RGB5 textures filled once from their pool sample with red and blue exchanged: smeared, banded rock, the shapes right and the colours wrong.
+- **Cause:** `tex_init_fill` uploads a pool's initial content into a plain Metal texture, which Metal also renders and clears into, so `tex_by_id` reads it without the RGB565 family's red / blue swap ([Texture swizzle through swizzled Metal views](#texture-swizzle-through-swizzled-metal-views)). The upload copied the guest's bits as they are, in the guest's order.
+- **Fix:** the one-time fill (`pkg_upload_` with no dirty stamp) exchanges the 5-bit red and blue fields on the CPU, so the texture holds Metal's order throughout (`rb_packed_shift`, from `nvn_fmt_to_mtl`'s swap). Packaged textures (`NvPkg`) keep the guest's bits and the swapping view; other formats keep the GPU deswizzle.
+- **Note:** `CopyBufferToTexture` into a plain texture also copies the guest's bits unchanged, so an RGB565-family copy may still be exchanged there. Not checked on a game; open.
+- **Check:** `t_view_swizzle` fills RGB565, RGB5A1, RGB5 and BGR565 textures from `CPU_UNCACHED` and `CPU_NO_ACCESS` pools through the real `tex_init_fill`, reads them on the GPU, draws into one texel and reads both again, and checks the guest storage is unchanged: 379 checks, none failed under the Metal debug layer; 36 fail with the exchange taken out.
+- **Found on:** [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md#rendering) (GitHub issue #183, the Depths' cave walls), found and checked in the game by the issue's reporters (M1 with 1.2.1, M4 with 1.4.3).
+
 ### `nvnTextureCompare` compares the channel mapping
 
 - **Symptom:** dark boxes and cream cloud rectangles behind HUD prompts, a black stamina wheel and a black System menu background (layout captures).

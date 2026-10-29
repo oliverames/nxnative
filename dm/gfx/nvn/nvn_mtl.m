@@ -2151,6 +2151,12 @@ static void zb_report(const tex_t *t, unsigned base, const char *why) {
             free(m); }
         MLOG("[zb] ser=%llu: block height log2 %d (packaged %d), stride %u, depth %u, target %d, samples %d", (unsigned long long)t->serial, (int)t->L.tileH, t->d.pkg_block_h, t->d.stride, t->d.depth, t->d.target, t->d.samples); }
 }
+// A packed 16-bit format that Metal has only with red and blue exchanged (RGB5, RGB5A1, RGB565: nvn_fmt_to_mtl's r/b swap): the bit position of red in Metal's format (blue is at bit 0), else 0
+static int rb_packed_shift(int f) {
+    uint32_t pf = 0; uint8_t sw[4];
+    if (!nvn_fmt_to_mtl(f, &pf, sw) || sw[0] != NVN_SWZ_B) return 0;
+    return pf == MTLPixelFormatB5G6R5Unorm ? 11 : pf == MTLPixelFormatBGR5A1Unorm ? 10 : 0;
+}
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse) {
     MTLTextureDescriptor *d = tex_desc(t, 1);
     if (!d) return nil;
@@ -2175,8 +2181,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     }
     g_bp_up_bytes += total;
     void *mb; uint64_t mo;
-    int use_gpu = !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
-    if (g_nvn_deswz_gpu && !use_gpu && !sparse) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
+    // The one-time fill (no stamp, tex_init_fill) goes into a plain Metal texture, which Metal also renders and clears into, so tex_by_id reads it without the RGB565 family's r/b swap:
+    // its bits must be in Metal's order. A packaged texture (NvPkg) keeps the guest's bits and its view swaps. The fill is repacked on the CPU. Tears of the Kingdom's Depths: the cave
+    // walls' initial-fill RGB565 / RGB5A1 textures were sampled with red and blue exchanged, smeared rock (GitHub issue #183)
+    int rb_shift = stamp ? 0 : rb_packed_shift(t->d.format);
+    int use_gpu = !rb_shift && !sparse && g_nvn_deswz_gpu && mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo);   // a sparse pool's texture is gathered through its page table on the CPU
+    if (g_nvn_deswz_gpu && !use_gpu && !sparse && !rb_shift) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
         // The GPU reads the memory pool at execution time, which is closer to a real Switch than a snapshot at CPU upload time; the dirty-page stamp is still taken before encoding, and later writes still trigger a re-upload.
         up_begin();
@@ -2235,6 +2245,10 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < layers; y++) {
             if (nvn_deswizzle(&t->d, l, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
+            if (rb_shift) {   // exchange the 5-bit red and blue fields, green and alpha stay
+                uint16_t *p = (uint16_t *)((uint8_t *)stg.contents + off), m = (uint16_t)(31u | 31u << rb_shift);
+                for (size_t i = 0, n = pitch * rows * z / 2; i < n; i++) p[i] = (uint16_t)((p[i] & ~m) | (p[i] & 31u) << rb_shift | (p[i] >> rb_shift & 31u));
+            }
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
                 for (size_t i = 0; i < nb; i++) g_zb[l] += !(q[2 * i] | q[2 * i + 1]);
                 g_zb_tot[l] += (uint32_t)nb; }

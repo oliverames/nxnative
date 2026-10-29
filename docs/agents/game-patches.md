@@ -31,6 +31,7 @@ Every piece of code that runs for one game and not the others: the rewriter's pa
 | [Pokémon Brilliant Diamond](#pokémon-brilliant-diamond) | 0 | 0 | 0 | 0 | 1 |  |
 | [Pokémon Scarlet](#pokémon-scarlet) | 1 | 0 | 0 | 0 | 0 | yes |
 | [SHIN MEGAMI TENSEI V: Vengeance](#shin-megami-tensei-v-vengeance) | 1 | 1 | 0 | 0 | 3 | yes |
+| [Subnautica](#subnautica) | 1 | 0 | 0 | 0 | 0 | yes |
 | [Subnautica: Below Zero](#subnautica-below-zero) | 1 | 0 | 0 | 0 | 0 | yes |
 | [Super Smash Bros. Ultimate](#super-smash-bros-ultimate) | 11 | 0 | 0 | 1 | 0 | yes |
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | yes |
@@ -459,6 +460,15 @@ Every piece of code that runs for one game and not the others: the rewriter's pa
   - host [hle_fpslock.c:58](../../dm/host/hle_fpslock.c#L58): engine frame limit set to fps_target: Unreal rhi.SyncInterval
   - host [hle_uemalloc.c:51](../../dm/host/hle_uemalloc.c#L51): Unreal's allocator on a host malloc zone
 
+### Subnautica
+
+[Subnautica](../../dm/games/0100429011144000/README.md), `0100429011144000`, [patches.py](../../dm/games/0100429011144000/patches.py).
+
+**Generalize?** Maybe: every Unity player constructs ALLOC_BUCKET the same way; a function-matched cut of its block count would need each Unity version's constructor call reviewed
+
+- **1.23.83358 `main`** `b3db5a1e…` ([patches.py:13](../../dm/games/0100429011144000/patches.py#L13))
+  - cut `+0x60ea64`: BucketAllocator ALLOC_BUCKET: at most 255 blocks of 4 MB (a 1 GB address region) → 63 (256 MB)
+
 ### Subnautica: Below Zero
 
 [Subnautica: Below Zero](../../dm/games/010014C011146000/README.md), `010014C011146000`, [patches.py](../../dm/games/010014C011146000/patches.py).
@@ -610,7 +620,7 @@ Cuts of Nintendo SDK `sdk` builds ([sdk_patches.py](../../dm/tools/sdk_patches.p
 - **sdk** `9c73fb73…` ([sdk_patches.py:102](../../dm/tools/sdk_patches.py#L102)): Patrick's Parabox 1.0.1
   - cut `+0x37c3b0`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x37c44c`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
-- **sdk** `3644a676…` ([sdk_patches.py:118](../../dm/tools/sdk_patches.py#L118)): AI: THE SOMNIUM FILES - nirvanA Initiative 1.0.2, Pokémon Scarlet 1.0.0, Subnautica: Below Zero 1.23.55063
+- **sdk** `3644a676…` ([sdk_patches.py:118](../../dm/tools/sdk_patches.py#L118)): AI: THE SOMNIUM FILES - nirvanA Initiative 1.0.2, Pokémon Scarlet 1.0.0, Subnautica 1.23.83358, Subnautica: Below Zero 1.23.55063
   - cut `+0x37c140`: AddressRegionManager constructor: node area limit mov w8,#0x3fe00000 → mov w8,#0x3e00000
   - cut `+0x37c1dc`: AddressRegionManager constructor: length of the node area registered as an occupied region mov w9,#0x3fe00000 → mov w9,#0x3e00000
   - cut `+0x37c334`: AllocateAddressRegion: alignment of regions from 32 MB to 1 GB mov w11,#0x2000000 → mov w11,#0x200000 (2 MB, as SDK 20)

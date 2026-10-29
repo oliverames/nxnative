@@ -18,7 +18,7 @@ NAMES = {'POOL_MIN', 'TEX_BASE', 'SSBO'}
 
 def load():
     tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-    nodes = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in FUNCS)
+    nodes: list[ast.stmt] = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name in FUNCS)
              or (isinstance(n, ast.Assign) and any(isinstance(t, (ast.Name, ast.Tuple)) and {getattr(e, 'id', None) for e in (t.elts if isinstance(t, ast.Tuple) else [t])} & NAMES for t in n.targets))]
     ns = {'re': re, 'abi': abi, 'dmsh_geometry': types.SimpleNamespace(HELPERS={})}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), ns)
