@@ -22,6 +22,7 @@ run: $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture 
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_commit_list
 	$(B)/t_thread_leak
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_case $(QUIET)
+	TMPDIR="$(abspath $(B))" $(B)/t_save_sync $(QUIET)
 	$(B)/t_audio
 	$(B)/t_audio_spsc
 	$(B)/t_fpslock
@@ -94,15 +95,16 @@ $(B)/t_gesture: t_gesture.c ../hle_touch.c ../front.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_gesture.c ../hle_touch.c
 $(B)/t_thread_leak: t_thread_leak.c ../thread.c ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_thread_leak.c
-$(B)/t_fs: t_fs.c t_fs_stub.c ../hle_fs.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs.c t_fs_stub.c ../hle_bigstack.c
-$(B)/t_fs_commit_list: t_fs_commit_list.c t_fs_stub.c ../hle_fs.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_fs_commit_list.c t_fs_stub.c ../hle_bigstack.c
-$(B)/t_fs_commit_list_tsan: t_fs_commit_list.c t_fs_stub.c ../hle_fs.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	$(CLANG) -O1 -g -fsanitize=thread -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_fs_commit_list.c t_fs_stub.c ../hle_bigstack.c
+$(B)/t_fs: t_fs.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c
+$(B)/t_fs_commit_list: t_fs_commit_list.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_fs_commit_list.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c
+$(B)/t_fs_commit_list_tsan: t_fs_commit_list.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -fsanitize=thread -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_fs_commit_list.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c
 .PHONY: fs-tsan
 fs-tsan: $(B)/t_fs_commit_list_tsan
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_commit_list_tsan
+<<<<<<< HEAD
 # The prefetch list's record and walk: one process per phase, phases 1 and 2 sharing one recorded list through DM_FS_USER (the recipe starts phase 1's directories new; the list itself is reset by phase 1)
 $(B)/t_fs_prefetch: t_fs_prefetch.c t_fs_stub.c ../hle_fs.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs_prefetch.c t_fs_stub.c ../hle_bigstack.c
@@ -114,8 +116,14 @@ fs-prefetch: $(B)/t_fs_prefetch
 	DM_PHASE=3 DM_SAVE="$(abspath $(B)/t_fp_p1)" TMPDIR="$(abspath $(B))" $(B)/t_fs_prefetch
 	DM_PHASE=4 DM_SAVE="$(abspath $(B)/t_fp_p2)" TMPDIR="$(abspath $(B))" $(B)/t_fs_prefetch
 run: fs-prefetch
-$(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
-	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs_case.c ../hle_bigstack.c
+$(B)/t_fs_case: t_fs_case.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_fs_case.c ../hle_bigstack.c ../save_sync.c
+run: $(B)/t_save_sync
+$(B)/t_save_sync: t_save_sync.c t_fs_stub.c ../hle_fs.c ../save_sync.c ../save_sync.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -Wall -Wno-unused-function -I.. $(GINC) -o $@ t_save_sync.c t_fs_stub.c ../hle_bigstack.c ../save_sync.c
+.PHONY: save-sync
+save-sync: $(B)/t_save_sync
+	TMPDIR="$(abspath $(B))" $(B)/t_save_sync $(QUIET)
 $(B)/t_audio: t_audio.c ../hle_audio.c ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wno-unused-function -I.. $(GINC) -o $@ t_audio.c -framework AudioToolbox
 $(B)/t_audio_spsc: t_audio_spsc.c ../hle_audio.c ../hle.h ../dm.h $(GAME_H) | $(B)
@@ -246,7 +254,7 @@ include ../../sanitizers/sanitizers.mk
 asan:
 	@$(call san_fresh,$(B)/asan,$(ASAN_FLAGS))
 	$(ASAN_ENV) $(MAKE) B=$(B)/asan SAN="$(ASAN_FLAGS)" run
-TSAN_T = t_audio t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_altstack
+TSAN_T = t_audio t_audio_device t_thread_leak t_oe t_fs_commit_list t_fs_case t_save_sync t_condvar t_condvar_old t_preempt t_system_event t_notify_sched t_altstack
 tsan-threads:
 	@$(call san_fresh,$(B)/tsan,$(TSAN_FLAGS))
 	$(TSAN_ENV) $(MAKE) B=$(B)/tsan SAN="$(TSAN_FLAGS)" tsan-threads-run
@@ -257,6 +265,7 @@ tsan-threads-run: $(addprefix $(B)/,$(TSAN_T))
 	$(B)/t_oe
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_commit_list
 	TMPDIR="$(abspath $(B))" $(B)/t_fs_case
+	TMPDIR="$(abspath $(B))" $(B)/t_save_sync
 	$(B)/t_condvar
 	$(B)/t_condvar_old
 	$(B)/t_preempt
