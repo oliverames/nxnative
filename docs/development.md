@@ -398,6 +398,14 @@ The unsigned IPA build still uses the repository's `dm/ios/DmIOS.xcodeproj`, ski
 
 The iPhone settings list can require a verified rewrite capability (`fixups:<NAME>` in `dm/games/settings.tsv`). A game's `patches.py` declares `CAPABILITIES = {build ID: (name, ...)}`; the rewriter writes those flags only for that main build. This keeps controls that require particular rewritten instructions out of older or unsupported builds. For example, NieR's resolution control requires its native scale/UV path and configurable preset bounds.
 
+### Experimental external-display routing
+
+Set `DM_EXTERNAL_DISPLAY=1` when running `dm/ios/tools/build_ipa.sh` to advertise a noninteractive external scene. This is a build-time opt-in. Default builds keep their existing scene manifest. iOS 27 registers a `UISceneAccessory` on the phone's game controller; iOS 26 uses the external scene role in the manifest.
+
+The external scene takes the existing game view and `CAMetalLayer`, and the phone keeps the touch controls, launcher, frame-rate label and text-input window. A handover drains graphics submissions and pauses the display link before moving the view, updates the scene metrics, then resumes. Disconnecting returns the same view to the phone. Scene focus is aggregated across the phone and external outputs, so a background notification from one scene cannot suspend another visible scene. Only the phone starts the guest runtime.
+
+The isolated native probe builds with `GAME=<profile> python3 dm/ios/tools/build_scene_metrics_probe.py --external-scenes --output <new scratch directory>`. It includes the complete production frontend and scene delegates, moves real UIKit views between two windows on one phone scene, and injects external scene identities. Graphics-gate and display-link calls are recorded by stubs. `Documents/results.json` records each assertion and the source hashes. This checks the routing policy and ownership; a physical external scene, cross-display drawable delivery, refresh-rate handover, controller input, and unplug during real GPU rendering still need hardware testing. The output remains SDR and preserves the existing 16:9 fit.
+
 ## Port another game
 
 Each game has a profile in `dm/games/<id>/`:

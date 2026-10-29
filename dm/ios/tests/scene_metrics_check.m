@@ -16,6 +16,7 @@ void dm_host_preload_start(int argc, char **argv) { (void)argc; (void)argv; }
 void dm_haptics_apple_init(void) {}
 UIView *dm_gamepad_view(CGRect frame) { return [[UIView alloc] initWithFrame:frame]; }
 void dm_gamepad_reset(void) {}
+void dm_gamepad_active(void) {}
 bool dm_show_launcher(void *view, void (*done)(void)) { (void)view; (void)done; return false; }
 uint64_t mtl_present_count(void) { return 0; }
 void dm_audio_suspend(int on) { (void)on; }
@@ -23,6 +24,7 @@ void dm_audio_reset(void) {}
 void dm_focus_set(int state) { (void)state; }
 void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
 void dm_gfx_suspend(int on) { (void)on; }
+void mtl_link_pause(int on) { (void)on; }
 
 static NSMutableArray *checks;
 static void check(NSString *name, BOOL passed) {

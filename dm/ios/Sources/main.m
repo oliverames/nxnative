@@ -12,6 +12,7 @@
 #include "romfs_image.h"
 #include "romfs_identity.h"
 #include "player_env.h"
+#import "DmSceneRouting.h"
 #ifndef DM_PLAYER_BUILD
 #define DM_PLAYER_BUILD 0
 #endif
@@ -168,6 +169,10 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
 @end
 @implementation App
 - (UISceneConfiguration *)application:(UIApplication *)a configurationForConnectingSceneSession:(UISceneSession *)s options:(UISceneConnectionOptions *)o {
+    if (front_ios_external_enabled() && [s.role isEqualToString:UIWindowSceneSessionRoleExternalDisplayNonInteractive]) {
+        UISceneConfiguration *configuration = [[UISceneConfiguration alloc] initWithName:@"External game display" sessionRole:s.role];
+        configuration.delegateClass = NSClassFromString(@"DmExternalSceneDelegate"); return configuration;
+    }
     return [[UISceneConfiguration alloc] initWithName:@"Default" sessionRole:s.role];
 }
 @end
@@ -180,15 +185,39 @@ int front_ios_boot_ok(void) { return g_boot_ok; }
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     self.window.rootViewController = front_ios_root();
-    [self.window makeKeyAndVisible];
+    [self.window makeKeyAndVisible]; front_ios_scene_event((UIWindowScene *)scene, 4);
 }
-- (void)sceneWillResignActive:(UIScene *)s { front_ios_focus_event(0); }
+- (void)sceneDidDisconnect:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 5); }
+- (void)sceneWillResignActive:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 0); }
 - (void)windowScene:(UIWindowScene *)scene didUpdateEffectiveGeometry:(UIWindowSceneGeometry *)previous {
     (void)previous; front_ios_scene_changed(scene);
 }
-- (void)sceneDidEnterBackground:(UIScene *)s { front_ios_focus_event(1); }
-- (void)sceneWillEnterForeground:(UIScene *)s { front_ios_focus_event(2); }
-- (void)sceneDidBecomeActive:(UIScene *)s { front_ios_scene_changed((UIWindowScene *)s); front_ios_focus_event(3); }
+- (void)sceneDidEnterBackground:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 1); }
+- (void)sceneWillEnterForeground:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 2); }
+- (void)sceneDidBecomeActive:(UIScene *)s { front_ios_scene_changed((UIWindowScene *)s); front_ios_scene_event((UIWindowScene *)s, 3); }
+@end
+
+// Only this content scene is added for opted-in builds. It never starts the
+// host and never becomes key: text input and game controls stay on the phone.
+@interface DmExternalSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property (strong, nonatomic) UIWindow *window;
+@end
+@implementation DmExternalSceneDelegate
+- (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)options {
+    (void)session; (void)options;
+    self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
+    self.window.rootViewController = front_ios_external_root((UIWindowScene *)scene);
+    self.window.hidden = NO; front_ios_scene_event((UIWindowScene *)scene, 4);
+}
+- (void)sceneWillResignActive:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 0); }
+- (void)sceneDidEnterBackground:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 1); }
+- (void)sceneWillEnterForeground:(UIScene *)s { front_ios_scene_event((UIWindowScene *)s, 2); }
+- (void)sceneDidBecomeActive:(UIScene *)s { front_ios_scene_changed((UIWindowScene *)s); front_ios_scene_event((UIWindowScene *)s, 3); }
+- (void)windowScene:(UIWindowScene *)scene didUpdateEffectiveGeometry:(UIWindowSceneGeometry *)previous { (void)previous; front_ios_scene_changed(scene); }
+- (void)sceneDidDisconnect:(UIScene *)s {
+    front_ios_external_disconnect(self.window.rootViewController);
+    front_ios_scene_event((UIWindowScene *)s, 5); self.window = nil;
+}
 @end
 
 int main(int argc, char **argv) {
