@@ -10,10 +10,13 @@ REPO = Path(__file__).resolve().parents[3]
 
 
 class ExternalSceneConfigurationTests(unittest.TestCase):
-    def configure(self, enabled):
+    def configure(self, enabled, include_stamp=False):
         script = (REPO / 'dm/ios/tools/build_ipa.sh').read_text()
-        block = script.split('# Explicit build opt-in:', 1)[1].split('# DM_METAL_CAPTURE=1:', 1)[0]
-        block = block[block.index('\n') + 1:]
+        if include_stamp:
+            block = script.split('xcodegen generate -q > /dev/null || die "xcodegen"\n', 1)[1].split('# DM_METAL_CAPTURE=1:', 1)[0]
+        else:
+            block = script.split('# Explicit build opt-in:', 1)[1].split('# DM_METAL_CAPTURE=1:', 1)[0]
+            block = block[block.index('\n') + 1:]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'Gen').mkdir()
@@ -23,10 +26,10 @@ class ExternalSceneConfigurationTests(unittest.TestCase):
                 'UISceneConfigurations': {'UIWindowSceneSessionRoleApplication': [{
                     'UISceneConfigurationName': 'Default', 'UISceneDelegateClassName': 'SceneDelegate'}]}}})
             path.write_bytes(original)
-            environment = {'PATH': os.defpath}
+            environment = {'PATH': os.defpath, 'DM': str(REPO / 'dm'), 'MSLDIR': 'b-fixture-chain'}
             if enabled is not None:
                 environment['DM_EXTERNAL_DISPLAY'] = enabled
-            result = subprocess.run(['bash', '-c', 'die() { exit 1; };\n' + block],
+            result = subprocess.run(['bash', '-c', 'die() { exit 1; }; t() { :; };\n' + block],
                                     cwd=root, env=environment, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             return original, path.read_bytes()
@@ -49,6 +52,17 @@ class ExternalSceneConfigurationTests(unittest.TestCase):
         self.assertEqual(configurations['UIWindowSceneSessionRoleApplication'][0]['UISceneDelegateClassName'], 'SceneDelegate')
         self.assertEqual(configurations['UIWindowSceneSessionRoleExternalDisplayNonInteractive'], [{
             'UISceneConfigurationName': 'External game display', 'UISceneDelegateClassName': 'DmExternalSceneDelegate'}])
+
+
+    def test_source_stamp_and_external_scene_survive_together(self):
+        _, configured = self.configure('1', include_stamp=True)
+        info = plistlib.loads(configured)
+        head = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short=12', 'HEAD'], text=True).strip()
+        self.assertIn(info['DMCommit'], (head, head + '+dirty'))
+        self.assertEqual(info['DMChain'], 'fixture-chain')
+        self.assertTrue(info['DMExternalDisplayEnabled'])
+        external = info['UIApplicationSceneManifest']['UISceneConfigurations']['UIWindowSceneSessionRoleExternalDisplayNonInteractive']
+        self.assertEqual(external[0]['UISceneDelegateClassName'], 'DmExternalSceneDelegate')
 
 
 if __name__ == '__main__':
