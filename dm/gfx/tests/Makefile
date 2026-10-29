@@ -107,6 +107,10 @@ check_t_perf_order: t_perf_order
 	DM_NVN_FAST_WAKE=0 DM_NVN_SLICE_MERGE=0 DM_NVN_CS_HOIST=0 MTL_DEBUG_LAYER=1 ./t_perf_order
 t_link_ticks: t_link_ticks.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+t_edr_policy: t_edr_policy.c ../nvn/nvn_edr.h
+	clang $(CFLAGS) -o $@ t_edr_policy.c
+t_edr_present: t_edr_present.m edr_probe_host.c ../nvn/nvn_edr.h $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_edr_present.m edr_probe_host.c $(MTL_T_SRC) $(FW)
 t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_cpu_tex.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_cpu_tex

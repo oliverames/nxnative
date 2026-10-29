@@ -5,10 +5,12 @@
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include "front.h"
 #include "hle.h"
 #include "dm.h"
 #include "haptics_apple.h"
+#include "../../gfx/nvn/nvn_edr.h"
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
@@ -46,6 +48,11 @@ int front_screen_max_fps(void) { return display_snapshot().max_fps; }
     if ((self = [super initWithFrame:f])) {
         CAMetalLayer *l = (CAMetalLayer *)self.layer;
         l.device = MTLCreateSystemDefaultDevice(); l.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        if (nvn_edr_requested()) {
+            l.pixelFormat = MTLPixelFormatRGBA16Float;
+            CGColorSpaceRef space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+            l.colorspace = space; CGColorSpaceRelease(space);
+        }
         l.framebufferOnly = NO; l.opaque = YES;
         self.backgroundColor = UIColor.blackColor;
         [self registerForTraitChanges:@[UITraitDisplayScale.class, UITraitHDRHeadroomUsageLimit.class]
@@ -77,15 +84,22 @@ int front_screen_max_fps(void) { return display_snapshot().max_fps; }
     DmDisplayMetrics value = {l.contentsScale, pixels.width, pixels.height, screen.currentEDRHeadroom,
         screen.potentialEDRHeadroom, (int)screen.maximumFramesPerSecond,
         self.traitCollection.hdrHeadroomUsageLimit == UIHDRHeadroomUsageLimitActive};
+    if (nvn_edr_requested()) {
+        // Ask for at most 2x SDR white; the shader is separately bounded by
+        // current headroom. An inactive/SDR-only scene keeps linear SDR output.
+        float wanted = value.headroom_active ? fmaxf(1, fminf(2, value.potential_headroom)) : 1;
+        l.contentsHeadroom = wanted;
+        l.preferredDynamicRange = wanted > 1 ? CADynamicRangeHigh : CADynamicRangeStandard;
+    }
     pthread_mutex_lock(&g_display_mu);
     DmDisplayMetrics previous = g_display; g_display = value;
     pthread_mutex_unlock(&g_display_mu);
     if (value.scale != previous.scale || value.width != previous.width || value.height != previous.height ||
         value.max_fps != previous.max_fps || value.headroom != previous.headroom ||
         value.potential_headroom != previous.potential_headroom || value.headroom_active != previous.headroom_active)
-        LOG("display: scene scale %.3f, drawable %.0fx%.0f, maximum %d Hz, EDR headroom %.3f / %.3f (%s); SDR output",
+        LOG("display: scene scale %.3f, drawable %.0fx%.0f, maximum %d Hz, EDR headroom %.3f / %.3f (%s); %s output",
             value.scale, value.width, value.height, value.max_fps, value.headroom, value.potential_headroom,
-            value.headroom_active ? "active" : "inactive");
+            value.headroom_active ? "active" : "inactive", nvn_edr_requested() ? "experimental SDR-to-EDR" : "SDR");
 }
 @end
 
@@ -162,6 +176,18 @@ UIViewController *front_ios_root(void) { return [DmRootVC new]; }
 void front_ios_scene_changed(UIWindowScene *scene) {
     if (g_root.game.window.windowScene != scene) return;
     [g_root.game setNeedsLayout]; [g_root.game layoutIfNeeded];
+}
+float front_present_edr_headroom(void) {
+    if (!nvn_edr_requested()) return 1;
+    // Existing layout/brightness events update immediately. A throttled main
+    // queue sample also follows headroom changes caused by EDR content itself;
+    // no second display link or UIKit call on the present thread is needed.
+    static _Atomic uint64_t next_sample;
+    uint64_t now = now_ns(), next = atomic_load(&next_sample);
+    if (now >= next && atomic_compare_exchange_strong(&next_sample, &next, now + 1000000000ull))
+        dispatch_async(dispatch_get_main_queue(), ^{ [g_root.game setNeedsLayout]; [g_root.game layoutIfNeeded]; });
+    DmDisplayMetrics value = display_snapshot();
+    return nvn_edr_headroom(1, value.headroom_active, value.headroom, value.potential_headroom);
 }
 
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.

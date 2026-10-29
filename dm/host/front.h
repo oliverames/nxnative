@@ -15,6 +15,9 @@ void front_run(void (*guest)(void));
 void *front_metal_layer(void);
 // The highest refresh rate of the rendering window's screen in Hz, 0 = not known. Any thread; iOS publishes a scene-derived snapshot from the main thread.
 int front_screen_max_fps(void);
+// Experimental EDR headroom for the current rendering scene, 1 when unavailable
+// or inactive. Any thread; the iOS front end refreshes UIKit values on main.
+float front_present_edr_headroom(void);
 // The frame rate the display link paces the game at (60, 30, 120; nvn_mtl.m link_sync): in fullscreen, a screen whose refresh rate is not a multiple of it is switched, while the game runs,
 // to a mode of the same size whose rate is, and back when the window leaves fullscreen or that screen (front_mac.m; none on iOS). Called from the present thread
 void front_screen_match(int fps);

@@ -16,6 +16,7 @@ void dm_host_preload_start(int argc, char **argv) { (void)argc; (void)argv; }
 void dm_haptics_apple_init(void) {}
 UIView *dm_gamepad_view(CGRect frame) { return [[UIView alloc] initWithFrame:frame]; }
 void dm_gamepad_reset(void) {}
+void dm_gamepad_active(void) {}
 bool dm_show_launcher(void *view, void (*done)(void)) { (void)view; (void)done; return false; }
 uint64_t mtl_present_count(void) { return 0; }
 void dm_audio_suspend(int on) { (void)on; }
@@ -55,10 +56,21 @@ static void checkSize(DmRootVC *root, CGSize size) {
     [super scene:scene willConnectToSession:session options:options];
     DmRootVC *root = (DmRootVC *)self.window.rootViewController;
     root.launched = YES;
+    // The production root deliberately has no ROM here. Replace its game-file
+    // hint before the first screen is shown so this probe cannot look like a
+    // broken game installation.
+    for (UIView *view in root.view.subviews.copy) [view removeFromSuperview];
+    UILabel *status = [[UILabel alloc] initWithFrame:CGRectInset(root.view.bounds, 32, 32)];
+    status.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    status.numberOfLines = 0; status.textAlignment = NSTextAlignmentCenter;
+    status.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
+    status.textColor = UIColor.whiteColor;
+    status.text = @"Verification app\nNo game files are used.\nRunning display checks.";
+    [root.view addSubview:status];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         checks = [NSMutableArray array];
         root.game = [[DmGameView alloc] initWithFrame:root.view.bounds];
-        [root.view addSubview:root.game];
+        [root.view insertSubview:root.game atIndex:0];
         g_layer = (CAMetalLayer *)root.game.layer; g_root = root;
         CGSize original = root.view.bounds.size;
         for (NSValue *size in @[[NSValue valueWithCGSize:CGSizeMake(390,844)],
@@ -73,8 +85,16 @@ static void checkSize(DmRootVC *root, CGSize size) {
         check(@"headroom snapshots contain valid ratios", isfinite(metrics.headroom) && metrics.headroom >= 1 && isfinite(metrics.potential_headroom) && metrics.potential_headroom >= 1);
         check(@"headroom usage follows the rendering view trait", metrics.headroom_active == (root.game.traitCollection.hdrHeadroomUsageLimit == UIHDRHeadroomUsageLimitActive));
         CAMetalLayer *layer = (CAMetalLayer *)root.game.layer;
-        check(@"the output format stays SDR", layer.pixelFormat == MTLPixelFormatBGRA8Unorm);
-        check(@"the default dynamic range stays standard", [layer.preferredDynamicRange isEqual:CADynamicRangeStandard]);
+        BOOL edr = nvn_edr_requested();
+        check(@"the output format follows the explicit opt-in", layer.pixelFormat == (edr ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm));
+        if (edr) {
+            CGColorSpaceRef expected = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+            check(@"EDR output uses extended-linear sRGB", CFEqual(layer.colorspace, expected)); CGColorSpaceRelease(expected);
+            float wanted = metrics.headroom_active ? fmaxf(1, fminf(2, metrics.potential_headroom)) : 1;
+            check(@"the layer tags the bounded experimental content headroom", layer.contentsHeadroom == wanted);
+            check(@"the preferred range follows scene permission", [layer.preferredDynamicRange isEqual:wanted > 1 ? CADynamicRangeHigh : CADynamicRangeStandard]);
+            check(@"the shader headroom follows current scene capacity", front_present_edr_headroom() == nvn_edr_headroom(1, metrics.headroom_active, metrics.headroom, metrics.potential_headroom));
+        } else check(@"the default dynamic range stays standard", [layer.preferredDynamicRange isEqual:CADynamicRangeStandard]);
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         check(@"the real scene produces a drawable", drawable != nil);
         check(@"drawable pixels exactly match the snapshot", drawable && drawable.texture.width == metrics.width && drawable.texture.height == metrics.height);
@@ -83,8 +103,13 @@ static void checkSize(DmRootVC *root, CGSize size) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 check(@"a worker reads the published refresh without UIKit", fps == metrics.max_fps);
                 NSInteger failed = 0; for (NSDictionary *item in checks) if (![item[@"passed"] boolValue]) failed++;
+                status.text = [NSString stringWithFormat:@"Verification app\nNo game files are used.\nVerification %@.\n%lu display checks, %ld failed.\n%@",
+                    failed ? @"failed" : @"passed", (unsigned long)checks.count, (long)failed,
+                    edr ? @"Mode: experimental EDR." : @"Mode: default SDR."];
+                [root.view bringSubviewToFront:status];
                 NSDictionary *report = @{@"checks":checks, @"failed":@(failed), @"externalDisplayTested":@NO,
-                    @"EDROutputEnabled":@NO, @"scale":@(metrics.scale), @"width":@(metrics.width), @"height":@(metrics.height),
+                    @"displayMessage":status.text,
+                    @"EDROutputEnabled":@(edr), @"scale":@(metrics.scale), @"width":@(metrics.width), @"height":@(metrics.height),
                     @"maximumFPS":@(metrics.max_fps), @"currentEDRHeadroom":@(metrics.headroom), @"potentialEDRHeadroom":@(metrics.potential_headroom),
                     @"systemVersion":UIDevice.currentDevice.systemVersion};
                 NSURL *documents = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask][0];
