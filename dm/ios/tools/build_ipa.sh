@@ -132,6 +132,17 @@ fi
 # DM_COPY_ROMFS=NO also for the prepared project: its Copy game resources phase (stage_resources.sh) then leaves the game files out and writes the image's identity; Gen/dm.xcconfig is made again by every run
 [ "${DM_COPY_ROMFS:-YES}" != NO ] || [ "$PREPARE_XCODE" != YES ] || echo "DM_COPY_ROMFS = NO" >> Gen/dm.xcconfig
 xcodegen generate -q > /dev/null || die "xcodegen"
+# Explicit build opt-in: default builds advertise no external content role and keep system mirroring unchanged.
+if [ "${DM_EXTERNAL_DISPLAY:-0}" = 1 ]; then
+  for command in \
+    "Add :DMExternalDisplayEnabled bool true" \
+    "Add :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleExternalDisplayNonInteractive array" \
+    "Add :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleExternalDisplayNonInteractive:0 dict" \
+    "Add :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleExternalDisplayNonInteractive:0:UISceneConfigurationName string External game display" \
+    "Add :UIApplicationSceneManifest:UISceneConfigurations:UIWindowSceneSessionRoleExternalDisplayNonInteractive:0:UISceneDelegateClassName string DmExternalSceneDelegate"; do
+    /usr/libexec/PlistBuddy -c "$command" Gen/Info.plist > /dev/null || die "external display scene"
+  done
+fi
 # DM_METAL_CAPTURE=1: a development build that may write GPU frame captures (MetalCaptureEnabled; the host's DM_GPU_CAPTURE switch writes them to Documents/gpu_captures)
 if [ "${DM_METAL_CAPTURE:-0}" = 1 ]; then /usr/libexec/PlistBuddy -c "Add :MetalCaptureEnabled bool true" Gen/Info.plist > /dev/null || die "MetalCaptureEnabled"; t "Metal frame capture: enabled (DM_METAL_CAPTURE=1)"; fi
 DM_RESOURCE_BUILD=${PKG:-} GAME=$GAME python3 tools/gen_resources.py "$IOS" "$ROMFS" "$MARKER" "$MSL_IOS/$MSLDIR" "$MSLDIR" "$AOC" "$XCODE_DD" "$DM/gfx/nvn/dmsh_chain.h" "$PSO" || die "generate Xcode resource paths"

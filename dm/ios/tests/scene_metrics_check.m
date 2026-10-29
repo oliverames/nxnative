@@ -23,6 +23,7 @@ void dm_audio_reset(void) {}
 void dm_focus_set(int state) { (void)state; }
 void guest_clock_freeze_for(int reason, int on) { (void)reason; (void)on; }
 void dm_gfx_suspend(int on) { (void)on; }
+void mtl_link_pause(int on) { (void)on; }
 
 static NSMutableArray *checks;
 static void check(NSString *name, BOOL passed) {

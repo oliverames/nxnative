@@ -9,6 +9,7 @@
 #include "hle.h"
 #include "dm.h"
 #include "haptics_apple.h"
+#import "DmSceneRouting.h"
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
@@ -18,6 +19,21 @@ const char *front_ios_boot_message(void);   // main.m: why a build that keeps th
 bool dm_show_launcher(void *view_controller, void (*done)(void));   // Launcher.swift: false = no launcher (no dm/launcher.json, or DM_LAUNCHER=0)
 
 static CAMetalLayer *g_layer;
+static NSMapTable<UIWindowScene *, NSNumber *> *g_scene_focus;
+static NSHashTable<UIViewController *> *g_external_roots;
+static __weak UIViewController *g_external_output;
+static int g_route_focus = 3;
+static BOOL g_route_runtime_started, g_route_suspended;
+static void external_refresh(void);
+static void external_register(UIViewController *controller);
+void front_ios_focus_event(int event);
+void mtl_link_pause(int on);
+int front_ios_external_enabled(void) { return [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMExternalDisplayEnabled"] boolValue]; }
+static CGRect fit_game(CGRect bounds) {
+    CGFloat w = bounds.size.width, h = bounds.size.height;
+    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
+    return CGRectMake(floor((bounds.size.width - w) / 2), floor((bounds.size.height - h) / 2), w, h);
+}
 static void front_ios_power_watch(void);
 static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
@@ -93,6 +109,8 @@ int front_screen_max_fps(void) { return display_snapshot().max_fps; }
 @property (nonatomic, strong) UIView *pad;
 @property (nonatomic, strong) UILabel *fps;
 @property (nonatomic) BOOL launched;
+@property (nonatomic, strong) id externalAccessory;
+@property (nonatomic, strong) UILabel *externalNote;
 - (void)startGame;
 @end
 static DmRootVC *g_root;
@@ -128,14 +146,16 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.fps) [self.view addSubview:self.fps];
     [self.view setNeedsLayout]; [self.view layoutIfNeeded];
     UIApplication.sharedApplication.idleTimerDisabled = YES;
+    if (front_ios_external_enabled()) { external_register(self); external_refresh(); }
     front_ios_boot();
+    g_route_runtime_started = YES;
+    if (front_ios_external_enabled()) external_refresh();
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     CGRect b = self.view.bounds; if (!self.game) return;
-    CGFloat w = b.size.width, h = b.size.height;   // Fit 16:9 into the whole screen
-    if (w / h > 16.0 / 9.0) w = h * 16.0 / 9.0; else h = w * 9.0 / 16.0;
-    self.game.frame = CGRectMake(floor((b.size.width - w) / 2), floor((b.size.height - h) / 2), w, h);
+    if (self.game.superview == self.view) self.game.frame = fit_game(b);
+    self.externalNote.frame = b;
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = UIEdgeInsetsInsetRect(b, self.view.safeAreaInsets); CGFloat u = MIN(b.size.height / 430.0, 1.3);
         self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
@@ -157,7 +177,108 @@ static void launcher_done(void) { [g_root startGame]; }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
 @end
-UIViewController *front_ios_root(void) { return [DmRootVC new]; }
+UIViewController *front_ios_root(void) {
+    if (!front_ios_external_enabled()) return [DmRootVC new];
+    // Reconnecting the primary scene reuses its controls, Metal layer and guest.
+    if (!g_root) g_root = [DmRootVC new];
+    return g_root;
+}
+
+@interface DmExternalRootVC : UIViewController
+@property (nonatomic, weak) UIWindowScene *scene;
+@property (nonatomic, strong) UILabel *hint;
+@end
+@implementation DmExternalRootVC
+- (void)viewDidLoad {
+    [super viewDidLoad]; self.view.backgroundColor = UIColor.blackColor;
+    self.hint = [[UILabel alloc] initWithFrame:self.view.bounds];
+    self.hint.text = @"Start the game on your iPhone"; self.hint.textAlignment = NSTextAlignmentCenter;
+    self.hint.textColor = UIColor.whiteColor; self.hint.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:self.hint];
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    if (g_root.game.superview == self.view) g_root.game.frame = fit_game(self.view.bounds);
+    self.hint.hidden = g_root.game.superview == self.view;
+}
+- (BOOL)prefersStatusBarHidden { return YES; }
+@end
+
+static int scene_focus(UIWindowScene *scene) { return scene ? ([g_scene_focus objectForKey:scene] ?: @3).intValue : 3; }
+static void external_register(UIViewController *controller) {
+    if (@available(iOS 27.0, *)) {
+        DmRootVC *root = (DmRootVC *)controller; if (root.externalAccessory) return;
+        UISceneConfiguration *configuration = [[UISceneConfiguration alloc] initWithName:@"External game display" sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
+        configuration.delegateClass = NSClassFromString(@"DmExternalSceneDelegate");
+        root.externalAccessory = [root registerSceneAccessory:[UISceneAccessory externalNonInteractiveSceneAccessoryWithConfiguration:configuration]];
+    }
+}
+UIViewController *front_ios_external_root(UIWindowScene *scene) {
+    DmExternalRootVC *root = [DmExternalRootVC new]; root.scene = scene;
+    if (!g_external_roots) g_external_roots = [NSHashTable weakObjectsHashTable];
+    [g_external_roots addObject:root];
+    return root;
+}
+void front_ios_external_disconnect(UIViewController *controller) {
+    [g_external_roots removeObject:controller];
+    if (g_external_output == controller) g_external_output = nil;
+    external_refresh();
+}
+static void external_refresh(void) {
+    if (!front_ios_external_enabled() || !g_root.game) return;
+    int desired = scene_focus(g_root.view.window.windowScene);
+    DmExternalRootVC *target = (DmExternalRootVC *)g_external_output;
+    if (target && (![g_external_roots containsObject:target] || scene_focus(target.scene) == 3)) target = nil;
+    for (DmExternalRootVC *root in g_external_roots) {
+        int focus = scene_focus(root.scene); if (focus < desired) desired = focus;
+        if (!target && focus != 3) target = root;
+    }
+    UIView *host = target ? target.view : g_root.view;
+    BOOL moving = g_root.game.superview != host;
+    // The phone retains the pad and FPS label. The very same Metal view/layer
+    // changes parent, so the renderer never observes a replacement layer or a
+    // second guest. Stop submissions and drain their output before that move.
+    if (desired == 3 && g_route_runtime_started && !g_route_suspended) {
+        front_ios_focus_event(1); g_route_suspended = YES;
+    }
+    BOOL fenced = moving && g_route_runtime_started && !g_route_suspended;
+    if (fenced) dm_gfx_suspend(1);
+    if (moving && g_route_runtime_started) mtl_link_pause(1);
+    if (moving) {
+        [g_root.game removeFromSuperview]; [host insertSubview:g_root.game atIndex:0];
+        [host setNeedsLayout]; [host layoutIfNeeded];
+        if (target) [target viewDidLayoutSubviews]; else [g_root viewDidLayoutSubviews];
+        [g_root.game setNeedsLayout]; [g_root.game layoutIfNeeded];
+        LOG("external display: render layer moved to %s; phone controls retained", target ? "external scene" : "primary scene");
+    }
+    g_external_output = target;
+    if (target && !g_root.externalNote) {
+        g_root.externalNote = [[UILabel alloc] initWithFrame:g_root.view.bounds];
+        g_root.externalNote.text = @"Playing on your external display"; g_root.externalNote.textAlignment = NSTextAlignmentCenter;
+        g_root.externalNote.textColor = UIColor.secondaryLabelColor;
+        g_root.externalNote.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [g_root.view insertSubview:g_root.externalNote atIndex:0];
+    }
+    g_root.externalNote.hidden = !target;
+    if (desired != 3) {
+        if (g_route_runtime_started && (moving || g_route_suspended)) mtl_link_pause(0);
+        if (g_route_suspended || g_route_focus == 3) { front_ios_focus_event(2); g_route_suspended = NO; }
+        else if (fenced) dm_gfx_suspend(0);
+        if (desired != g_route_focus) front_ios_focus_event(desired == 1 ? 3 : 0);
+    }
+    g_route_focus = desired;
+}
+void front_ios_scene_event(UIWindowScene *scene, int event) {
+    if (!front_ios_external_enabled()) { if (event < 4) front_ios_focus_event(event); return; }
+    if (!g_scene_focus) g_scene_focus = [NSMapTable weakToStrongObjectsMapTable];
+    if (event == 5) [g_scene_focus removeObjectForKey:scene];
+    else {
+        int focus = event == 1 ? 3 : event == 3 ? 1 : 2;
+        if (event == 4) focus = scene.activationState == UISceneActivationStateForegroundActive ? 1 : scene.activationState == UISceneActivationStateForegroundInactive ? 2 : 3;
+        [g_scene_focus setObject:@(focus) forKey:scene];
+    }
+    external_refresh();
+}
 void front_ios_scene_changed(UIWindowScene *scene) {
     if (g_root.game.window.windowScene != scene) return;
     [g_root.game setNeedsLayout]; [g_root.game layoutIfNeeded];
