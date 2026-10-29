@@ -2,17 +2,42 @@
 // Output windows share one real phone scene. Distinct identities below model
 // external scene events; this is not a physical external-display test.
 #import <UIKit/UIKit.h>
+#import <AVFAudio/AVFAudio.h>
 #import <GameController/GameController.h>
 #include <stdatomic.h>
 #include <time.h>
+static int audio_activations, audio_last_suspend, pad_activations;
+static BOOL audio_activation_fails;
+// Deterministic session responses exercise the real production notification and
+// activation code without claiming a physical audio-route or controller test.
+@interface ExternalProbeAudioSession : NSObject
++ (instancetype)sharedInstance;
+- (BOOL)setCategory:(NSString *)category error:(NSError **)error;
+- (BOOL)setPreferredSampleRate:(double)value error:(NSError **)error;
+- (BOOL)setPreferredIOBufferDuration:(double)value error:(NSError **)error;
+- (BOOL)setActive:(BOOL)value error:(NSError **)error;
+@property(readonly) double sampleRate;
+@property(readonly) double IOBufferDuration;
+@end
+@implementation ExternalProbeAudioSession
++ (instancetype)sharedInstance { static ExternalProbeAudioSession *s; static dispatch_once_t once; dispatch_once(&once, ^{ s = [self new]; }); return s; }
+- (BOOL)setCategory:(NSString *)category error:(NSError **)error { (void)category; (void)error; return YES; }
+- (BOOL)setPreferredSampleRate:(double)value error:(NSError **)error { (void)value; (void)error; return YES; }
+- (BOOL)setPreferredIOBufferDuration:(double)value error:(NSError **)error { (void)value; (void)error; return YES; }
+- (BOOL)setActive:(BOOL)value error:(NSError **)error { (void)value; audio_activations++; if (audio_activation_fails && error) *error = [NSError errorWithDomain:@"verification" code:1 userInfo:nil]; return !audio_activation_fails; }
+- (double)sampleRate { return 48000; }
+- (double)IOBufferDuration { return .005; }
+@end
+#define AVAudioSession ExternalProbeAudioSession
 #include "../Sources/front_ios.m"
+#undef AVAudioSession
 #define main unused_production_main
 #include "../Sources/main.m"
 #undef main
 
 static _Atomic int guest_starts;
 static NSMutableArray *trace;
-static int last_focus, frozen, link_paused;
+static int last_focus, focus_calls, frozen, link_paused;
 uint64_t g_t0_ns;
 uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
 int dm_main(int argc, char **argv) { (void)argc; (void)argv; atomic_fetch_add(&guest_starts, 1); return 0; }
@@ -20,12 +45,12 @@ void dm_host_preload_start(int argc, char **argv) { (void)argc; (void)argv; }
 void dm_haptics_apple_init(void) {}
 UIView *dm_gamepad_view(CGRect frame) { return [[UIView alloc] initWithFrame:frame]; }
 void dm_gamepad_reset(void) {}
-void dm_gamepad_active(void) {}
+void dm_gamepad_active(void) { pad_activations++; }
 bool dm_show_launcher(void *view, void (*done)(void)) { (void)view; (void)done; return false; }
 uint64_t mtl_present_count(void) { return 0; }
-void dm_audio_suspend(int on) { (void)on; }
+void dm_audio_suspend(int on) { audio_last_suspend = on; }
 void dm_audio_reset(void) {}
-void dm_focus_set(int state) { last_focus = state; }
+void dm_focus_set(int state) { last_focus = state; focus_calls++; }
 void guest_clock_freeze_for(int reason, int on) { (void)reason; frozen = on; }
 void dm_gfx_suspend(int on) { [trace addObject:on ? @"gate close" : @"gate open"]; }
 void mtl_link_pause(int on) { link_paused = on; [trace addObject:on ? @"link pause" : @"link resume"]; }
@@ -64,6 +89,7 @@ static void checkMove(NSString *name) {
         check(@"this app explicitly opts into external routing", front_ios_external_enabled());
         front_ios_scene_event(phone, 3);
         g_boot_ok = 1; [root startGame];
+        front_ios_audio_watch();   // viewDidLoad intentionally took the no-game-files branch above
         void *layer = front_metal_layer(); DmGameView *game = root.game;
         [root startGame];
         check(@"starting again retains the single game view and layer", root.game == game && front_metal_layer() == layer);
@@ -93,6 +119,30 @@ static void checkMove(NSString *name) {
         front_ios_scene_event(identity, 3); [trace removeAllObjects];
         front_ios_scene_event(phone, 1);
         check(@"active external scene keeps the shared runtime alive when phone backgrounds", trace.count == 0 && last_focus == 1 && !frozen);
+
+        // The phone's own activation must still recover audio/input even though
+        // the external scene keeps aggregate guest focus active throughout.
+        front_ios_scene_event(phone, 0);
+        [NSNotificationCenter.defaultCenter postNotificationName:AVAudioSessionInterruptionNotification object:nil
+            userInfo:@{AVAudioSessionInterruptionTypeKey:@(AVAudioSessionInterruptionTypeBegan)}];
+        check(@"the real interruption observer suspends audio", g_audio_intr && audio_last_suspend == 1);
+        int activations_before = audio_activations, pads_before = pad_activations, focus_calls_before = focus_calls;
+        front_ios_scene_event(phone, 3);
+        check(@"phone activation clears a missed interruption-end and retries audio", !g_audio_intr && !g_session_off && audio_last_suspend == 0 && audio_activations == activations_before + 1);
+        check(@"phone activation refreshes manual controllers with external focus unchanged", pad_activations == pads_before + 1);
+        check(@"phone recovery leaves active guest focus and the graphics gate unchanged", last_focus == 1 && g_route_focus == 1 && focus_calls == focus_calls_before && !frozen && !g_route_suspended && trace.count == 0);
+        audio_activation_fails = YES; front_ios_audio_session();
+        check(@"a refused session activation is retained for retry", g_session_off);
+        front_ios_scene_event(phone, 0); audio_activation_fails = NO; activations_before = audio_activations;
+        front_ios_scene_event(phone, 3);
+        check(@"phone activation retries a failed session while external focus stays active", !g_session_off && audio_activations == activations_before + 1 && audio_last_suspend == 0);
+        front_ios_scene_event(identity, 0); front_ios_scene_event(phone, 0);
+        [NSNotificationCenter.defaultCenter postNotificationName:AVAudioSessionInterruptionNotification object:nil
+            userInfo:@{AVAudioSessionInterruptionTypeKey:@(AVAudioSessionInterruptionTypeBegan)}];
+        activations_before = audio_activations; pads_before = pad_activations;
+        front_ios_scene_event(phone, 3);
+        check(@"aggregate inactive-to-active recovery runs once", !g_audio_intr && !g_session_off && audio_activations == activations_before + 1 && pad_activations == pads_before + 1);
+        front_ios_scene_event(identity, 3); front_ios_scene_event(phone, 1);
         front_ios_scene_event(identity, 0);
         check(@"visible inactive scenes lose input focus without suspending graphics", trace.count == 0 && last_focus == 2 && !frozen);
         front_ios_scene_event(identity, 1);
@@ -122,6 +172,7 @@ static void checkMove(NSString *name) {
             NSDictionary *report = @{@"displayMessage":status.text, @"sourceProvenance":provenance, @"checks":checks, @"failed":@(failed), @"guestStarts":@(atomic_load(&guest_starts)),
                 @"physicalExternalDisplayTested":@NO, @"outputWindowsSharePhoneScene":@YES,
                 @"externalSceneIdentitiesInjected":@YES, @"graphicsGateAndDisplayLinkStubbed":@YES,
+                @"productionAudioObserverUsed":@YES, @"nativeAudioActivationMocked":@YES, @"controllerActivationStubbed":@YES,
                 @"systemVersion":UIDevice.currentDevice.systemVersion};
             NSURL *documents = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask][0];
             [[NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingPrettyPrinted error:NULL]

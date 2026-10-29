@@ -28,6 +28,7 @@ static BOOL g_route_runtime_started, g_route_suspended;
 static void external_refresh(void);
 static void external_register(UIViewController *controller);
 void front_ios_focus_event(int event);
+static void front_ios_active_recover(void);
 void mtl_link_pause(int on);
 int front_ios_external_enabled(void) { return [[NSBundle.mainBundle objectForInfoDictionaryKey:@"DMExternalDisplayEnabled"] boolValue]; }
 static CGRect fit_game(CGRect bounds) {
@@ -271,6 +272,7 @@ static void external_refresh(void) {
 }
 void front_ios_scene_event(UIWindowScene *scene, int event) {
     if (!front_ios_external_enabled()) { if (event < 4) front_ios_focus_event(event); return; }
+    int already_active = g_route_focus == 1;
     if (!g_scene_focus) g_scene_focus = [NSMapTable weakToStrongObjectsMapTable];
     if (event == 5) [g_scene_focus removeObjectForKey:scene];
     else {
@@ -279,6 +281,10 @@ void front_ios_scene_event(UIWindowScene *scene, int event) {
         [g_scene_focus setObject:@(focus) forKey:scene];
     }
     external_refresh();
+    // An active external scene can keep aggregate focus unchanged while the
+    // phone returns. Preserve audio/controller recovery without resetting guest
+    // focus or its activation time. A focus transition already recovered below.
+    if (event == 3 && already_active && scene == g_root.view.window.windowScene) front_ios_active_recover();
 }
 void front_ios_scene_changed(UIWindowScene *scene) {
     if (g_root.game.window.windowScene != scene) return;
@@ -432,6 +438,11 @@ static void front_ios_audio_watch(void) {
 
 // Scene lifecycle (called by SceneDelegate in main.m): 0 resign active, 1 enter background, 2 return to foreground, 3 become active. On entering background, freeze the guest clock and suspend after in-flight GPU work completes (submitting GPU work in background gets the process killed).
 // The screen stays on while the game is active: only touches reset the idle timer, so with a controller (or during a cutscene) the screen dimmed and locked mid-game
+static void front_ios_active_recover(void) {
+    if (g_audio_intr) { LOG("audio session: active again with no interruption-ended notice; resuming"); g_audio_intr = 0; g_session_off = 1; }
+    if (g_session_off) front_ios_audio_session();
+    front_ios_audio_apply(); dm_gamepad_active();
+}
 void front_ios_focus_event(int ev) {
     if (!g_layer) return;
     switch (ev) {
@@ -440,8 +451,6 @@ void front_ios_focus_event(int ev) {
         case 2: dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); front_ios_audio_session(); g_audio_bg = 0; front_ios_audio_apply(); dm_focus_set(2); break;
         case 3:   // Becoming active again also ends an interruption whose "ended" never came (not every one sends it), and retries a session that would not activate on the way back
             UIApplication.sharedApplication.idleTimerDisabled = YES;
-            if (g_audio_intr) { LOG("audio session: active again with no interruption-ended notice; resuming"); g_audio_intr = 0; g_session_off = 1; }
-            if (g_session_off) front_ios_audio_session();
-            front_ios_audio_apply(); dm_gamepad_active(); dm_focus_set(1); break;
+            front_ios_active_recover(); dm_focus_set(1); break;
     }
 }
