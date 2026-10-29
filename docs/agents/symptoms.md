@@ -236,6 +236,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 
 ## Audio
 
+- an iOS session whose activation failed can stay silent while the → [Experimental route recovery](../reference/audio.md#experimental-route-recovery)
 - abort with Result 0x499 in `audio::GetAudioRendererWorkBufferSize`. → [SDK 8's longer `AudioRendererParameter`](../reference/audio.md#sdk-8s-longer-audiorendererparameter)
 - the game is silent; only the game's updates render (catch-up frames that nothing plays). The log has `audren: OpenAudioRenderer (no event)` and no `render thread started`. → [A renderer opened without an event](../reference/audio.md#a-renderer-opened-without-an-event)
 - `[RED] audren: a second renderer` right after the first open, with the same work buffer and "original device 1 mode 1". → [The SDK's open with an event calls the open without one (`t_in_open`)](../reference/audio.md#the-sdks-open-with-an-event-calls-the-open-without-one-t_in_open)

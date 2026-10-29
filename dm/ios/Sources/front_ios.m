@@ -9,6 +9,7 @@
 #include "hle.h"
 #include "dm.h"
 #include "haptics_apple.h"
+#include "DmAudioRoutePolicy.h"
 
 UIView *dm_gamepad_view(CGRect frame);
 void dm_gamepad_reset(void);
@@ -294,6 +295,24 @@ static int g_audio_bg, g_audio_intr;
 static void front_ios_audio_apply(void) { dm_audio_suspend(g_audio_bg || g_audio_intr); }
 static void front_ios_audio_watch(void) {
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    // Experimental, default off. A failed foreground activation otherwise only
+    // retries on returning to the app, even if CarPlay/headphones change route.
+    const char *route_recovery = getenv("DM_IOS_AUDIO_ROUTE_RECOVERY");
+    if (route_recovery && !strcmp(route_recovery, "1")) {
+        [nc addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+            unsigned reason = [n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntValue];
+            AVAudioSession *s = AVAudioSession.sharedInstance;
+            LOG("audio route: reason %u, outputs %s, %.0f Hz, %.2f ms, activation %s", reason,
+                s.currentRoute.outputs.description.UTF8String, s.sampleRate, s.IOBufferDuration * 1000,
+                g_session_off ? "failed" : "active");
+            if (dm_audio_route_retry(reason, g_audio_bg, g_audio_intr, g_session_off)) {
+                front_ios_audio_session();
+                // Restart a silent fallback only after the native session is
+                // usable. Healthy route changes keep RemoteIO's own handling.
+                if (!g_session_off) dm_audio_reset();
+            }
+        }];
+    }
     [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue], reason = [n.userInfo[AVAudioSessionInterruptionReasonKey] unsignedIntegerValue];
         if (type == AVAudioSessionInterruptionTypeBegan) { LOG("audio session: interrupted (reason %lu)", (unsigned long)reason); g_audio_intr = 1; }
