@@ -122,9 +122,18 @@ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2
 int dm_opmode(void);   // hle_oe.c: 0 = handheld
 
 @interface DmGamepad : UIView
+- (void)showPlayers;
+- (void)controllerMoved:(GCController *)controller player:(int)player;
+- (void)syncPlayers:(BOOL)any;
 @end
 static __weak DmGamepad *g_view;
 static void pads_start(void);   // Physical controllers, below
+static int g_assign;
+static BOOL g_assigning;
+static BOOL player_one_held(void);
+static void show_players(DmGamepad *view);
+static void controller_identified(GCController *controller);
+static void controllers_refreshed(void);
 
 @implementation DmGamepad {
     NSMapTable<UITouch *, NSNumber *> *_owner;     // touch → control (with the key for C_BTN or the stick for C_STICK, << 8)
@@ -141,6 +150,7 @@ static void pads_start(void);   // Physical controllers, below
     BOOL _full, _tap;                              // the 3D layout / the Tap layout is current
     CALayer *_controls;                            // holds every control layer: hidden while a physical controller is connected (the view itself stays, for game touches)
     BOOL _padOff;                                  // a physical controller is connected: every touch goes to the game
+    UIButton *_players;                            // explicit opt-in assignment, separate from the hidden touch-control layer
     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
 }
 
@@ -193,6 +203,13 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidConnectNotification object:nil];
         [nc addObserver:self selector:@selector(padsChanged:) name:GCControllerDidDisconnectNotification object:nil];
         pads_start();
+        if (g_assign) {
+            _players = [UIButton buttonWithType:UIButtonTypeSystem];
+            _players.configuration = UIButtonConfiguration.tintedButtonConfiguration;
+            [_players setTitle:@"Players" forState:UIControlStateNormal];
+            [_players addTarget:self action:@selector(showPlayers) forControlEvents:UIControlEventTouchUpInside];
+            [self addSubview:_players];
+        }
         [self padsChanged:nil];
         motion_start();
         phone_motion_start();
@@ -407,6 +424,8 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
 
 - (void)layoutSubviews {
     [super layoutSubviews];
+    CGRect safe = self.safe;
+    _players.frame = CGRectMake(CGRectGetMidX(safe) - 64, CGRectGetMinY(safe) + 44, 128, 36);
     UIWindowScene *ws = self.window.windowScene; if (ws) atomic_store(&g_iface_orient, (int)ws.effectiveGeometry.interfaceOrientation);
     CGFloat u = self.u;
     [CATransaction begin]; [CATransaction setDisableActions:YES];
@@ -447,16 +466,19 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
 }
 
 // ---- Physical controllers ----
-// Each controller with an extended gamepad profile is a player of its own, as on the Mac (front_mac.m): it holds a slot (pad_slots.h: player 1 first, a reconnected controller
-// gets its player back) and goes to dm_pad_set_player, and hle_hid.c reports player n on its own npad while the slot is held (dm_pad_players). Player 1's controller is ORed
+// Each controller with an extended gamepad profile is a player of its own, as on the Mac (front_mac.m): it holds a slot (pad_slots.h: player 1 first, model-name reconnect
+// hints) and goes to dm_pad_set_player, and hle_hid.c reports player n on its own npad while the slot is held (dm_pad_players). Player 1's controller is ORed
 // with the touch gamepad; a one-player game that supports only No1 / Handheld still sees every controller as player 1 (hle_hid.c). Each player has its controller's rumble and
 // gyro; the phone's gyro is player 1's. With DM_PAD_MERGE=1 every controller is player 1, as before (the last one moved wins)
 static pad_slots g_slots;
 static GCController *g_held[DM_PLAYERS];   // the controller of each slot, kept alive while it holds it (the slot table keys on its pointer)
+static uint64_t g_route_generation[DM_PLAYERS];
 static int g_merge;
 static int32_t axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * 32767); }
 static void read_pad(GCExtendedGamepad *g) {
+    if (g_assign && !NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ read_pad(g); }); return; }
     int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)g.controller); if (p < 0) return;
+    if (g_assigning) return;
     dm_haptics_apple_controller(p, g.controller);
     uint64_t m = 0;
     #define K(btn, bit) if (btn.isPressed) m |= 1ull << bit
@@ -474,7 +496,57 @@ static const char *pad_name(GCController *c) { return c.vendorName.UTF8String ?:
 static void npad_name(int p, char *out, size_t cap) { uint32_t id = dm_player_npad(p); if (id == 0x20) snprintf(out, cap, "handheld"); else snprintf(out, cap, "%u", id); }
 static void pads_start(void) {
     const char *e = getenv("DM_PAD_MERGE"); g_merge = e && atoi(e);
+    e = getenv("DM_PAD_ASSIGN"); g_assign = !g_merge && e && !strcmp(e, "1");
     LOG("front end: %s", g_merge ? "every controller is player 1 (DM_PAD_MERGE)" : "each controller is a player of its own, the touch gamepad plays with player 1");
+}
+static BOOL player_one_held(void) { return g_held[0] != nil; }
+static void pad_changed(GCExtendedGamepad *g) {
+    if (g_assign) {
+        if (!NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ pad_changed(g); }); return; }
+        int p = pad_slot_of(&g_slots, (__bridge const void *)g.controller);
+        if (p >= 0) controller_identified(g.controller);
+    }
+    read_pad(g);
+}
+static void pad_release(int p) {
+    GCController *c = g_held[p];
+    c.extendedGamepad.valueChangedHandler = nil;
+    g_route_generation[p]++;
+    dm_motion_detach(c, p); dm_haptics_apple_controller(p, nil);
+    dm_pad_set_player(p, 0, 0, 0, 0, 0);
+}
+static void pad_attach(GCController *c, int p) {
+    pad_keep_system_buttons(c);
+    if (g_assign) { c.handlerQueue = dispatch_get_main_queue(); c.playerIndex = p < 4 ? (GCControllerPlayerIndex)p : GCControllerPlayerIndexUnset; }
+    c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; pad_changed(g); };
+    if (!g_assigning) {
+        dm_motion_attach(c, p);
+        if (g_assign && c.motion.valueChangedHandler) {
+            GCMotionValueChangedHandler handler = c.motion.valueChangedHandler;
+            uint64_t generation = g_route_generation[p];
+            c.motion.valueChangedHandler = ^(GCMotion *m) {
+                if (NSThread.isMainThread && g_held[p] == c && g_route_generation[p] == generation) handler(m);
+            };
+        }
+    }
+}
+// Main-queue transaction: publish releases at both old players before changing
+// ownership, then reroute motion/haptics and publish each controller at its new player.
+static BOOL assign_controller(GCController *c, int target) {
+    if (!g_assign || !NSThread.isMainThread || target < 0 || target >= DM_PLAYERS) return NO;
+    int from = pad_slot_of(&g_slots, (__bridge const void *)c);
+    if (from < 0) return NO;
+    if (from == target) return YES;
+    GCController *other = g_held[target];
+    pad_release(from); if (other) pad_release(target);
+    pad_slot_assign(&g_slots, (__bridge const void *)c, target);
+    g_held[from] = other; g_held[target] = c;
+    for (int p = 0; p < DM_PLAYERS; p++) if (p == from || p == target) if (g_held[p]) {
+        pad_attach(g_held[p], p); read_pad(g_held[p].extendedGamepad);
+    }
+    dm_pad_players(pad_slot_mask(&g_slots)); [g_view syncPlayers:YES]; controllers_refreshed();
+    LOG("controller '%s' assigned to player %d%s", pad_name(c), target + 1, other ? " (swapped)" : "");
+    return YES;
 }
 // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil otherwise); returns whether a controller is in use
 static BOOL pads_merged(GCController *gone) {
@@ -490,39 +562,146 @@ static BOOL pads_merged(GCController *gone) {
     if (!any) { dm_haptics_apple_controller(0, nil); dm_pad_set(0, 0, 0, 0, 0); }
     return any;
 }
-static BOOL pads_slotted(GCController *gone) {
-    NSArray<GCController *> *now = GCController.controllers; char nb[16];
+static BOOL pads_slotted_now(NSArray<GCController *> *now, GCController *gone) {
+    char nb[16];
     for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] && (g_held[p] == gone || ![now containsObject:g_held[p]])) {
         npad_name(p, nb, sizeof nb); LOG("controller '%s' disconnected: player %d (npad %s) is free", pad_name(g_held[p]), p + 1, nb);
-        g_held[p].extendedGamepad.valueChangedHandler = nil;
-        dm_motion_detach(g_held[p], p);   // player 1's: the phone's gyro (if on) takes over from its next sample
-        dm_haptics_apple_controller(p, nil);
+        pad_release(p);   // player 1's phone gyro can take over from its next sample
+        if (g_assign) g_held[p].playerIndex = GCControllerPlayerIndexUnset;
         pad_slot_free(&g_slots, (__bridge const void *)g_held[p]); g_held[p] = nil;
-        dm_pad_set_player(p, 0, 0, 0, 0, 0);   // nothing stays pressed
     }
     for (GCController *c in now) if (c.extendedGamepad && c != gone && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) {
         int p = pad_slot_take(&g_slots, (__bridge const void *)c, pad_name(c));
         if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad_name(c), DM_PLAYERS); continue; }
-        g_held[p] = c; pad_keep_system_buttons(c);
-        c.extendedGamepad.valueChangedHandler = ^(GCExtendedGamepad *g, GCControllerElement *el) { (void)el; read_pad(g); };
-        dm_motion_attach(c, p);
+        g_held[p] = c; pad_attach(c, p);
         npad_name(p, nb, sizeof nb); LOG("controller '%s' connected: player %d (npad %s)%s", pad_name(c), p + 1, nb, c.motion.hasRotationRate ? ", with motion (gyro)" : "");
         read_pad(c.extendedGamepad);
     }
     dm_pad_players(pad_slot_mask(&g_slots));
     return pad_slot_mask(&g_slots) != 0;
 }
+- (void)showPlayers { show_players(self); }
+- (void)syncPlayers:(BOOL)any {
+    _padOff = g_assign ? player_one_held() : any;
+    _controls.hidden = _padOff; _players.hidden = !any; [self reset];
+}
+- (void)controllerMoved:(GCController *)controller player:(int)player {
+    if (player < 0) { [_players setTitle:@"Players" forState:UIControlStateNormal]; _players.accessibilityLabel = nil; return; }
+    [_players setTitle:[NSString stringWithFormat:@"Players · %d", player + 1] forState:UIControlStateNormal];
+    _players.accessibilityLabel = [NSString stringWithFormat:@"Players. Last input: %@, player %d", controller.vendorName ?: @"Controller", player + 1];
+}
 - (void)padsChanged:(NSNotification *)note {
+    if (g_assign && !NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ [self padsChanged:note]; }); return; }
     GCController *c = note.object, *gone = [note.name isEqual:GCControllerDidDisconnectNotification] ? c : nil;
     if (c && (!c.extendedGamepad || g_merge)) LOG("controller %s: %s%s", gone ? "disconnected" : "connected", pad_name(c), c.extendedGamepad ? "" : " (no extended gamepad profile: not used)");
-    BOOL any = g_merge ? pads_merged(gone) : pads_slotted(gone);
-    dispatch_async(dispatch_get_main_queue(), ^{ self->_padOff = any; self->_controls.hidden = any; [self reset]; });   // the touch gamepad hides while any controller is in use
+    BOOL any = g_merge ? pads_merged(gone) : pads_slotted_now(GCController.controllers, gone);
+    if (g_assign) { [self syncPlayers:any]; controllers_refreshed(); }
+    else dispatch_async(dispatch_get_main_queue(), ^{ [self syncPlayers:any]; });
 }
 @end
+
+// The sheet is intentionally session-only. Model names are display labels, not
+// stable identities; moving a control highlights the live connection to choose.
+@interface DmControllerSheet : UITableViewController <UIAdaptivePresentationControllerDelegate>
+@property(nonatomic, strong) GCController *selectedController;
+@end
+static __weak DmControllerSheet *g_controller_sheet;
+static __weak GCController *g_last_controller;
+static int g_last_player = -1;
+static NSArray<GCController *> *assigned_controllers(void) {
+    NSMutableArray *controllers = [NSMutableArray array];
+    for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) [controllers addObject:g_held[p]];
+    return controllers;
+}
+static void assignment_started(void) {
+    g_assigning = YES; [g_view reset];
+    for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) {
+        g_route_generation[p]++; dm_motion_detach(g_held[p], p);
+        dm_haptics_apple_controller(p, nil); dm_pad_set_player(p, 0, 0, 0, 0, 0);
+    }
+}
+static void assignment_finished(void) {
+    if (!g_assigning) return;
+    g_assigning = NO;
+    for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) { pad_attach(g_held[p], p); read_pad(g_held[p].extendedGamepad); }
+    [g_view reset];
+}
+static void controller_identified(GCController *controller) {
+    int player = pad_slot_of(&g_slots, (__bridge const void *)controller);
+    if (g_last_controller == controller && g_last_player == player) return;
+    g_last_controller = controller; g_last_player = player;
+    [g_view controllerMoved:controller player:player]; [g_controller_sheet.tableView reloadData];
+}
+static void controllers_refreshed(void) {
+    g_last_player = pad_slot_of(&g_slots, (__bridge const void *)g_last_controller);
+    [g_view controllerMoved:g_last_controller player:g_last_player];
+    [g_controller_sheet.tableView reloadData];
+    DmControllerSheet *top = (DmControllerSheet *)g_controller_sheet.navigationController.topViewController;
+    [top.tableView reloadData];
+}
+@implementation DmControllerSheet
+- (void)viewDidLoad {
+    [super viewDidLoad]; self.title = self.selectedController ? @"Assign player" : @"Controllers";
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(done)];
+}
+- (void)viewWillAppear:(BOOL)animated { [super viewWillAppear:animated]; [self.tableView reloadData]; }
+- (void)done { [self.navigationController dismissViewControllerAnimated:YES completion:^{ assignment_finished(); }]; }
+- (void)presentationControllerDidDismiss:(UIPresentationController *)presentationController { (void)presentationController; assignment_finished(); }
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    (void)tableView; (void)section; return self.selectedController ? DM_PLAYERS : assigned_controllers().count;
+}
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    (void)tableView; (void)section;
+    return self.selectedController ? @"Choosing an occupied player swaps both controllers. Touch controls always belong to Player 1." :
+        @"Move a control to identify its row. Choose a controller, then its player. Identical models can change order after reconnecting. Controller input is released while this sheet is open.";
+}
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView;
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    GCController *c; int p;
+    if (self.selectedController) { p = (int)indexPath.row; c = g_held[p]; }
+    else { NSArray *controllers = assigned_controllers(); if (indexPath.row >= (NSInteger)controllers.count) return cell;
+        c = controllers[indexPath.row]; p = pad_slot_of(&g_slots, (__bridge const void *)c); }
+    cell.textLabel.text = [NSString stringWithFormat:@"Player %d", p + 1];
+    NSString *name = c.vendorName ?: @"Controller";
+    if (self.selectedController) {
+        cell.detailTextLabel.text = c == self.selectedController ? @"Currently assigned" : c ? [@"Swap with " stringByAppendingString:name] : @"Available";
+        cell.accessoryType = c == self.selectedController ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+    } else {
+        cell.detailTextLabel.text = c == g_last_controller ? [name stringByAppendingString:@" · last input"] : name;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    }
+    return cell;
+}
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    if (self.selectedController) {
+        assign_controller(self.selectedController, (int)indexPath.row);
+        [self.navigationController popToRootViewControllerAnimated:YES];
+    } else {
+        NSArray *controllers = assigned_controllers(); if (indexPath.row >= (NSInteger)controllers.count) return;
+        DmControllerSheet *next = [[DmControllerSheet alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        next.selectedController = controllers[indexPath.row]; [self.navigationController pushViewController:next animated:YES];
+    }
+}
+@end
+static void show_players(DmGamepad *view) {
+    if (!g_assign || g_assigning) return;
+    UIViewController *parent = view.window.rootViewController; if (!parent) return;
+    while (parent.presentedViewController) parent = parent.presentedViewController;
+    assignment_started();
+    DmControllerSheet *sheet = [[DmControllerSheet alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    g_controller_sheet = sheet;
+    UINavigationController *navigation = [[UINavigationController alloc] initWithRootViewController:sheet];
+    navigation.modalPresentationStyle = UIModalPresentationPageSheet;
+    navigation.presentationController.delegate = sheet;
+    [parent presentViewController:navigation animated:YES completion:nil];
+}
 
 UIView *dm_gamepad_view(CGRect frame) { DmGamepad *v = [[DmGamepad alloc] initWithFrame:frame]; g_view = v; return v; }
 void dm_gamepad_active(void) { dispatch_async(dispatch_get_main_queue(), ^{ for (GCController *c in GCController.controllers) dm_motion_rearm(c); }); }   // On become active: motion_apple.h
 void dm_gamepad_reset(void) {   // On resign active: release everything (a key held while switching away and released in background gets no "release")
+    if (g_assign && !NSThread.isMainThread) { dispatch_async(dispatch_get_main_queue(), ^{ dm_gamepad_reset(); }); return; }
     dispatch_async(dispatch_get_main_queue(), ^{ [g_view reset]; });
     pthread_mutex_lock(&g_mu); g_shake_btn = 0; pthread_mutex_unlock(&g_mu); publish();
     if (g_merge) dm_pad_set(0, 0, 0, 0, 0);

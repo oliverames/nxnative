@@ -222,6 +222,18 @@ Most service calls can be found before they crash, before the first boot or the 
 
 ## Input
 
+### Opt-in player assignment on iOS
+
+`DM_PAD_ASSIGN=1`, set before launch, adds a **Players** button while a physical controller is assigned. Move a control to identify its current connection, choose that controller, then choose a player. An occupied player is explicitly labeled as a swap. Model names are labels, not persistent identities; identical controllers can reconnect in a different order. The existing automatic assignment remains the default, and `DM_PAD_MERGE=1` takes precedence over this experiment.
+
+The main-queue transaction releases both old button states, clears old motion, stops old haptic routes, then moves the owners and reconnect hints together. It publishes the new connection mask and current button state at the destination. Motion and rumble follow the controller. Generation checks prevent a queued old gyro callback from writing its former player after a swap or disconnect. Controllers use GameController's main `handlerQueue` in the opt-in mode; connect, reset and assignment operations use that same queue. Player indicators follow slots 1–4 where the controller supports them; later players use the on-screen labels.
+
+Touch controls and the phone's motion remain Player 1. In this opt-in mode, a physical controller on a later player leaves Player 1's touch controls available. While the assignment sheet is open, physical controllers' input, gyro and rumble routes are released; moving a control still identifies its row. Closing the sheet restores each controller's current input at its assigned player. The game continues running, and the phone's motion remains independent. The game's existing supported-player rules still apply: a one-player title may combine later players into Player 1.
+
+`t_hid` checks swaps, moves, masks, reconnect hints and duplicate-name ambiguity without controllers. `dm/ios/tools/build_controller_probe.py --output <new-scratch-folder>` builds a native fixture using the actual iOS adapter, Apple's writable snapshot controllers and inert host endpoints. It checks release order, rerouting, stale gyro callbacks and the sheet's row data. It starts no discovery, phone sensors or haptic engines. Physical wired/Bluetooth operation, multiple real controllers, LED/rumble feel and interactive sheet use remain unverified.
+
+Apple's SDK documents the controller's [callback queue](https://developer.apple.com/documentation/gamecontroller/gcdevice/handlerqueue), [player indicator](https://developer.apple.com/documentation/gamecontroller/gccontroller/playerindex) and [snapshot controllers](https://developer.apple.com/documentation/gamecontroller/gccontroller/controllerwithextendedgamepad()). The SDK says vendor names are not unique and player indices do not persist. This experiment stores no controller identity or assignment preferences.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

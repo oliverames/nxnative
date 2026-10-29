@@ -62,6 +62,21 @@ static void t_slots(void) {
     CHECK(pad_slot_mask(&s) == (1u << DM_PLAYERS) - 1, "every slot held");
     CHECK(pad_slot_take(&s, &many[DM_PLAYERS - 3], "Pro Controller") == -1, "a ninth controller gets no player");
     CHECK(pad_slot_take(&s, NULL, "x") == -1 && pad_slot_free(&s, NULL) == -1, "no owner, no slot");
+    CHECK(pad_slot_assign(&s, &a, 1) == 0 && pad_slot_of(&s, &a) == 1 && pad_slot_of(&s, &b2) == 0, "explicit assignment swaps occupied players even when every slot is held");
+    CHECK(!strcmp(s.last[1], "Xbox Wireless Controller") && !strcmp(s.last[0], "DualSense Wireless Controller"), "reconnect names follow both swapped controllers");
+    CHECK(pad_slot_mask(&s) == (1u << DM_PLAYERS) - 1, "a full swap loses no connected player");
+    pad_slot_free(&s, &a);
+    CHECK(pad_slot_take(&s, &a, "Xbox Wireless Controller") == 1, "a different-model reconnect follows its explicit assignment");
+    pad_slots before = s;
+    CHECK(pad_slot_assign(&s, &a, -1) == -1 && pad_slot_assign(&s, &a, DM_PLAYERS) == -1 && pad_slot_assign(&s, NULL, 0) == -1 && !memcmp(&s, &before, sizeof s), "invalid assignments leave every slot and reconnect hint unchanged");
+    CHECK(pad_slot_assign(&s, &a, 1) == 1 && !memcmp(&s, &before, sizeof s), "assigning the current player is a no-op");
+    pad_slot_free(&s, &b2);
+    CHECK(pad_slot_assign(&s, &a, 0) == 1 && !s.owner[1] && !s.last[1][0] && pad_slot_of(&s, &a) == 0, "moving to a free player clears the old reservation");
+    memset(&s, 0, sizeof s);
+    pad_slot_take(&s, &a, "Same model"); pad_slot_take(&s, &b, "Same model");
+    CHECK(pad_slot_assign(&s, &a, 1) == 0 && pad_slot_of(&s, &a) == 1 && pad_slot_of(&s, &b) == 0, "identical model names can be explicitly swapped by live connection");
+    pad_slot_free(&s, &a); pad_slot_free(&s, &b);
+    CHECK(pad_slot_take(&s, &b2, "Same model") == 0, "duplicate-name reconnect is a free-name hint, not persistent identity");
     memset(&s, 0, sizeof s);   // DM_KBD_PLAYER=own: the keyboard holds player 1 for good
     CHECK(pad_slot_take(&s, &kbd, "keyboard") == 0 && pad_slot_take(&s, &a, "Xbox Wireless Controller") == 1, "with the keyboard on its own the first controller is player 2");
 }

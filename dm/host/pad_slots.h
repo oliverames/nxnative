@@ -1,6 +1,6 @@
 // Player slots of the physical controllers (front_mac.m; pure, so tests/t_hid.c checks it without controllers): each controller holds one slot, slot p is player p + 1
-// (hle_hid.c dm_player_npad gives its npad). A connecting controller takes, in this order: a free slot whose last holder had its name (the same controller reconnected gets its
-// player back; GameController gives a controller no identity across a reconnect, so two controllers of one model may trade places), player 1 when it is free, the lowest slot
+// (hle_hid.c dm_player_npad gives its npad). A connecting controller takes, in this order: a free slot whose last holder had its model name (a reconnect hint, not identity:
+// GameController gives no persistent identity, so identical models may trade places), player 1 when it is free, the lowest slot
 // no controller has held yet (so a slot stays kept for a controller that went away while others are in use), then the lowest free slot. With every slot held it gets none (-1).
 // A disconnected controller frees its slot and leaves its name on it. The owner is any pointer that stays the same while the controller is connected (the front end keeps the
 // GCController); a holder that never disconnects (the keyboard with DM_KBD_PLAYER=own) takes slot 0 first and keeps it.
@@ -30,6 +30,19 @@ static int pad_slot_take(pad_slots *s, const void *owner, const char *name) {
 static int pad_slot_free(pad_slots *s, const void *owner) {
     int p = pad_slot_of(s, owner); if (p >= 0) s->owner[p] = NULL;
     return p;
+}
+// Explicit session assignment: move to a free slot or swap its current owner.
+// Reconnect hints follow the assigned controllers, not the old player numbers.
+static int pad_slot_assign(pad_slots *s, const void *owner, int target) {
+    int from = pad_slot_of(s, owner);
+    if (from < 0 || target < 0 || target >= DM_PLAYERS) return -1;
+    if (from == target) return from;
+    char name[sizeof s->last[0]]; memcpy(name, s->last[from], sizeof name);
+    s->owner[from] = s->owner[target]; s->owner[target] = owner;
+    if (s->owner[from]) memcpy(s->last[from], s->last[target], sizeof name);
+    else memset(s->last[from], 0, sizeof name);
+    memcpy(s->last[target], name, sizeof name);
+    return from;
 }
 static uint32_t pad_slot_mask(const pad_slots *s) {   // bit p: slot p is held
     uint32_t m = 0; for (int i = 0; i < DM_PLAYERS; i++) if (s->owner[i]) m |= 1u << i;
