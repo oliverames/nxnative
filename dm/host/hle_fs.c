@@ -618,8 +618,8 @@ HLE_FORCE("_ZN2nn2fs22GetSaveDataRestoreFlagEPbPKc", "fsp-srv; save data restore
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
 // Whether a save is mounted: save_archive.c (the launchers' export and import) must not read or replace a save while
-// the game holds the working directory that belongs to it. Its own definition is weak: the Mac launcher links the
-// archive file without the host and has no mounts to ask about.
+// the game holds the working directory that belongs to it. save_archive.c defines the same function weakly, for the
+// Mac launcher, which links the archive without the host and has no mount table to ask.
 int dm_fs_save_in_use(void);
 int dm_fs_save_in_use(void) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
