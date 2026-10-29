@@ -617,6 +617,17 @@ HLE_FORCE("_ZN2nn2fs20ExtendDeviceSaveDataEll", "fsp-srv; extend device save dat
 HLE_FORCE("_ZN2nn2fs22GetSaveDataRestoreFlagEPbPKc", "fsp-srv; save data restored from a backup: never", Result, h_fs_RestoreFlag, uint8_t *out, const char *name) { (void)name; *out = 0; return RES_OK; }
 static _Atomic uint64_t g_save_commits;   // number of successful commits (used by the front end when going to background to wait for "the game's current save has been committed")
 uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
+// Whether a save is mounted: save_archive.c (the launchers' export and import) must not read or replace a save while
+// the game holds the working directory that belongs to it. Its own definition is weak: the Mac launcher links the
+// archive file without the host and has no mounts to ask about.
+int dm_fs_save_in_use(void);
+int dm_fs_save_in_use(void) {
+    PATH_LOCK(); pthread_mutex_lock(&g_lock);
+    int used = 0;
+    for (int i = 0; i < g_nmnt; i++) if (g_mnt[i].commit[0]) { used = 1; break; }
+    pthread_mutex_unlock(&g_lock);
+    return used;
+}
 // Both Commit overloads share this transaction engine. Caller holds the path
 // and mount locks; front-end failure notification is delivered after unlocking.
 static Result commit_mount_locked(int i, int *notify_error) {
