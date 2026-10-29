@@ -574,6 +574,8 @@ The game's own work and its frame rate stay as they are; the host avoids work of
 
 Each game's notes are in its profile folder, `dm/games/<id>/README.md`: what the profile needs and why, what was found on the game, Mac routes and open items. The [games table](../dm/games/README.md#games) lists them.
 
+Diagnostic experiments: [Native-aspect boundary diagnostics](aspect-tracing.md) records existing guest boundaries without changing network or rendering behavior.
+
 ## Tools (`dm/tools`)
 
 | Tool | What it does |
