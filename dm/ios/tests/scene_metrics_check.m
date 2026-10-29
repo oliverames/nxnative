@@ -73,8 +73,16 @@ static void checkSize(DmRootVC *root, CGSize size) {
         check(@"headroom snapshots contain valid ratios", isfinite(metrics.headroom) && metrics.headroom >= 1 && isfinite(metrics.potential_headroom) && metrics.potential_headroom >= 1);
         check(@"headroom usage follows the rendering view trait", metrics.headroom_active == (root.game.traitCollection.hdrHeadroomUsageLimit == UIHDRHeadroomUsageLimitActive));
         CAMetalLayer *layer = (CAMetalLayer *)root.game.layer;
-        check(@"the output format stays SDR", layer.pixelFormat == MTLPixelFormatBGRA8Unorm);
-        check(@"the default dynamic range stays standard", [layer.preferredDynamicRange isEqual:CADynamicRangeStandard]);
+        BOOL edr = nvn_edr_requested();
+        check(@"the output format follows the explicit opt-in", layer.pixelFormat == (edr ? MTLPixelFormatRGBA16Float : MTLPixelFormatBGRA8Unorm));
+        if (edr) {
+            CGColorSpaceRef expected = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
+            check(@"EDR output uses extended-linear sRGB", CFEqual(layer.colorspace, expected)); CGColorSpaceRelease(expected);
+            float wanted = metrics.headroom_active ? fmaxf(1, fminf(2, metrics.potential_headroom)) : 1;
+            check(@"the layer tags the bounded experimental content headroom", layer.contentsHeadroom == wanted);
+            check(@"the preferred range follows scene permission", [layer.preferredDynamicRange isEqual:wanted > 1 ? CADynamicRangeHigh : CADynamicRangeStandard]);
+            check(@"the shader headroom follows current scene capacity", front_present_edr_headroom() == nvn_edr_headroom(1, metrics.headroom_active, metrics.headroom, metrics.potential_headroom));
+        } else check(@"the default dynamic range stays standard", [layer.preferredDynamicRange isEqual:CADynamicRangeStandard]);
         id<CAMetalDrawable> drawable = [layer nextDrawable];
         check(@"the real scene produces a drawable", drawable != nil);
         check(@"drawable pixels exactly match the snapshot", drawable && drawable.texture.width == metrics.width && drawable.texture.height == metrics.height);
@@ -84,7 +92,7 @@ static void checkSize(DmRootVC *root, CGSize size) {
                 check(@"a worker reads the published refresh without UIKit", fps == metrics.max_fps);
                 NSInteger failed = 0; for (NSDictionary *item in checks) if (![item[@"passed"] boolValue]) failed++;
                 NSDictionary *report = @{@"checks":checks, @"failed":@(failed), @"externalDisplayTested":@NO,
-                    @"EDROutputEnabled":@NO, @"scale":@(metrics.scale), @"width":@(metrics.width), @"height":@(metrics.height),
+                    @"EDROutputEnabled":@(edr), @"scale":@(metrics.scale), @"width":@(metrics.width), @"height":@(metrics.height),
                     @"maximumFPS":@(metrics.max_fps), @"currentEDRHeadroom":@(metrics.headroom), @"potentialEDRHeadroom":@(metrics.potential_headroom),
                     @"systemVersion":UIDevice.currentDevice.systemVersion};
                 NSURL *documents = [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask][0];

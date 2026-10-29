@@ -2,6 +2,18 @@
 
 The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. Each entry: symptom, cause, fix, the games it was found on. The [symptom index](../agents/symptoms.md) lists every symptom.
 
+## Experimental SDR-to-EDR presentation
+
+`DM_PRESENT_EDR=1`, set before launch, opts the iOS rendering layer into RGBA16Float and extended-linear sRGB. With the switch absent, its BGRA8 SDR output is unchanged. This experiment expands highlights in the final SDR picture; the original game's HDR signal is unavailable. Bright game text and HUD pixels are part of that picture and can also brighten. Separate UIKit controls are unaffected.
+
+The final present shader decodes sRGB once, keeps linear luminance through 0.5 unchanged, and increases highlight RGB together. Peak gain is bounded by the rendering scene's current and potential headroom, with an experimental ceiling of 2× SDR white. Inactive scenes and SDR-only displays use a gain of 1. The iOS 26 layer properties `preferredDynamicRange` and `contentsHeadroom` describe this output. Existing brightness, scene and trait updates refresh the snapshot; an opt-in, once-per-second main-queue sample also follows content-driven headroom changes.
+
+MetalFX spatial scaling keeps its existing perceptual SDR input and output. Conversion happens once in the final float-target pass. Screenshot targets stay SDR, including when MetalFX and EDR are both enabled. Aspect fit, the complete source picture and the existing display link are unchanged. Float drawables use twice the storage per pixel of BGRA8; power, frame pacing and perceived brightness need device measurements before enabling this by default.
+
+`t_edr_policy` checks opt-in and headroom policy without a GPU. `t_edr_present` runs the production present shaders on synthetic textures and reads back SDR parity, transfer-function boundaries, headroom changes, aspect-fit bars and MetalFX output. `dm/ios/tools/build_edr_probe.py --output <new-scratch-folder>` builds those GPU checks as an unsigned native app and records source hashes. It requires `GAME` only for source constants. Its synthetic headroom does not measure a display's luminance. The separate scene-metrics probe checks the actual production layer configuration with the switch both absent and enabled. Device appearance, external displays and sustained gameplay cost remain separate checks.
+
+Apple's [tone-mapping guidance](https://developer.apple.com/documentation/metal/performing-your-own-tone-mapping) describes the float, extended-linear layer pipeline. The current SDK documents [preferred dynamic range](https://developer.apple.com/documentation/quartzcore/calayer/preferreddynamicrange), [content headroom](https://developer.apple.com/documentation/quartzcore/calayer/contentsheadroom) and the screen's [current EDR headroom](https://developer.apple.com/documentation/uikit/uiscreen/currentedrheadroom). These references were read from Xcode's local documentation archive and SDK headers.
+
 ## Textures and formats
 
 ### Null textures in diagnostic logs
