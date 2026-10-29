@@ -31,7 +31,9 @@ HLE_FORCE("_ZN2nn4nifm22IsNetworkRequestOnHoldEv", "offline: on hold for the fir
     return h > 0;
 }
 HLE_FORCE("_ZN2nn4nifm18IsNetworkAvailableEv", "offline: always unavailable / DM_NET=1: the host's own connectivity", int, h_nifm_Available, void) { return dm_net_online() && dm_net_own_ip() ? 1 : 0; }
-HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "offline: reports failure, shows no system network screen", Result, h_nifm_HandleErr, void) { return RES_FAIL; }
+// Returns bool (`and w0, w0, #1`, Metroid Dread's sdk+0x336210): whether the system's network screen resolved the error.
+// Neither socket mode presents that system screen, so neither can report it resolved.
+HLE_FORCE("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", "not resolved, shows no system network screen (offline or DM_NET=1)", unsigned, h_nifm_HandleErr, void) { return 0; }
 HLE_FORCE("_ZN2nn4nifm26GetCurrentPrimaryIpAddressEPNS_6socket6InAddrE", "offline: no IP / DM_NET=1: the probed interface", Result, h_nifm_GetIp, uint32_t *a) {
     if (!dm_net_online() || !dm_net_own_ip()) { if (a) *a = 0; return RES_FAIL; }
     *a = dm_net_own_ip(); return RES_OK;
