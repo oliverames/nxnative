@@ -5180,6 +5180,12 @@ static id<MTL4Compiler> g_comp4;
 // g_arch4: the files that may hold bases with a vertex layout, g_arch4p: the files that hold none (p<seq>.mtl4a: the prebuild's, and any flush whose bases all read their vertices
 // themselves). A base with a layout is looked up in g_arch4 alone: each file a lookup misses in costs about 0.06 ms, and a cold start's misses were for such bases, in the 13 prebuilt files
 static NSArray<id<MTL4Archive>> *g_arch4, *g_arch4p; static NSString *g_arch_dir; static int g_arch_seq;
+// Opt-in experiment: with a usable bundle, defer only the device's p files.
+// Mixed/layout files stay eager, preserving compaction's immutable startup state.
+// The deferred arrays are published once, never appended to while readers run.
+static NSArray<NSString *> *g_arch4p_deferred;
+static NSArray<id<MTL4Archive>> *g_arch4p_late;
+static dispatch_once_t g_arch4p_once;
 // Compaction: every start writes a file or more (each flush captures only what is new), Breath of the Wild 5-7 per start, and each file a base is not in costs a lookup about 0.06 ms.
 // With more than PSO_ARCH_COMPACT files of bases with a vertex layout, the bases the prewarm takes from them are captured again from the original shader functions, so the flush
 // after the prewarm writes them into one file; the old files are then removed (open archives stay usable for the rest of the run). Bases the
@@ -5296,6 +5302,23 @@ static int arch_file_ok(NSString *path) {
     struct stat st; int ok = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && arch_container_ok(fd, (uint64_t)st.st_size);
     close(fd); return ok;
 }
+static NSArray<id<MTL4Archive>> *pso_device_pull_archives(void) {
+    if (!g_arch4p_deferred.count) return nil;
+    dispatch_once(&g_arch4p_once, ^{
+        uint64_t t0 = bp_now(); unsigned long long bytes = 0;
+        NSMutableArray<id<MTL4Archive>> *opened = [NSMutableArray array];
+        for (NSString *path in g_arch4p_deferred) {
+            NSError *error = nil;
+            id<MTL4Archive> archive = arch_file_ok(path) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:path] error:&error] : nil;
+            if (archive) { [opened addObject:archive]; bytes += [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize]; }
+            else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", path.UTF8String,
+                      error ? error.localizedDescription.UTF8String : "not a pipeline archive");
+        }
+        g_arch4p_late = [opened copy];
+        MLOG("pipeline archive: bundle miss opened %lu deferred p files, %.1f MB, in %.1f ms", (unsigned long)opened.count, bytes / 1048576.0, (bp_now() - t0) / 1e6);
+    });
+    return g_arch4p_late;
+}
 static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
     const char *e = getenv("DM_PSO_BUNDLE");
     if (!e || !*e || !strcmp(e, "off")) return;
@@ -5373,17 +5396,24 @@ static void pso4_init(void) {
             });
 #endif
             uint64_t t0 = bp_now(); unsigned long long bytes = 0;
-            NSMutableArray<NSString *> *runf = [NSMutableArray array];
+            NSMutableArray<NSString *> *runf = [NSMutableArray array], *deferred = [NSMutableArray array];
+            const char *lazy = getenv("DM_PSO_LAZY_DEVICE_ARCHIVES");
+            int defer_pull = g_arch_bundle && lazy && !strcmp(lazy, "1");
             NSArray<NSString *> *names = [[[NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]]
                                           sortedArrayUsingSelector:@selector(compare:)];
             for (NSString *n in names.reverseObjectEnumerator) {   // newest first
                 NSString *p = [g_arch_dir stringByAppendingPathComponent:n]; NSError *ae = nil;
-                id<MTL4Archive> a = arch_file_ok(p) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae] : nil;
                 int pf = [n hasPrefix:@"p"];
+                // Reserve every existing sequence before any capture can flush,
+                // including archives whose opening is deferred or fails later.
+                g_arch_seq = MAX(g_arch_seq, [n substringFromIndex:pf].intValue + 1);
+                if (defer_pull && pf) { [deferred addObject:p]; continue; }
+                id<MTL4Archive> a = arch_file_ok(p) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae] : nil;
                 if (a) { [pf ? archp : arch addObject:a]; if (!pf) [runf addObject:p]; bytes += [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize]; }
                 else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive");
-                g_arch_seq = MAX(g_arch_seq, [n substringFromIndex:pf].intValue + 1);
             }
+            g_arch4p_deferred = [deferred copy];
+            if (deferred.count) MLOG("pipeline archive: %lu device p files deferred until a no-layout bundle miss (DM_PSO_LAZY_DEVICE_ARCHIVES=1); mixed/layout files remain eager", (unsigned long)deferred.count);
             if (runf.count > PSO_ARCH_COMPACT && arch_compact_allowed()) { g_compact_enabled = 1; g_compact_files = runf; }
             MLOG("pipeline archive %s: %lu files (%lu of bases without a vertex layout), %.1f MB, opened in %.1f ms", g_arch_dir.UTF8String, (unsigned long)(arch.count + archp.count - (g_arch_bundle != nil)),
                  (unsigned long)archp.count - (g_arch_bundle != nil), bytes / 1048576.0, (bp_now() - t0) / 1e6);
@@ -5517,7 +5547,11 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
     else {
         uint64_t t0 = bp_now();
         int vd = 0; for (int i = 0; i < 31 && !vd; i++) vd = bk.va[i][0] != 0;   // a vertex layout (MTLVertexFormatInvalid is 0)
-        if (!vd) for (id<MTL4Archive> a in g_arch4p) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) break;
+        NSArray<id<MTL4Archive>> *late = nil;
+        if (!vd) {
+            for (id<MTL4Archive> a in g_arch4p) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) break;
+            if (!base) { late = pso_device_pull_archives(); for (id<MTL4Archive> a in late) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) break; }
+        }
         int from_run = 0;
         if (!base) for (id<MTL4Archive> a in g_arch4) if ((base = [a newRenderPipelineStateWithDescriptor:b error:nil])) { from_run = 1; break; }
         uint64_t t1 = bp_now();
@@ -5529,7 +5563,7 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
             if (cb) { base = cb; g_compacted++; }
         }
         if (!base) {
-            if (g_arch4.count + g_arch4p.count) { g_pt_miss_n++; g_pt_miss_ns += t1 - t0; }
+            if (g_arch4.count + g_arch4p.count + late.count) { g_pt_miss_n++; g_pt_miss_ns += t1 - t0; }
             if (compile) {
                 NSError *be = nil; base = arch_capture(b, &be, vd); job->error = be; job->compiled = 1;
                 g_pt_comp_ns += bp_now() - t1;
@@ -5778,6 +5812,7 @@ static void pre_pair(NSString *vk, NSString *fk, int zero) {
         MTL4RenderPipelineDescriptor *m = pre_desc(vk, fk, zero);
         if (!m) { g_pre_skipped++; return; }
         for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
+        for (id<MTL4Archive> a in pso_device_pull_archives()) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         NSError *e = nil; id ps = arch_capture(m, &e, 0);
         if (ps) g_pre_built++;

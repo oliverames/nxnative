@@ -920,6 +920,16 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md#found-on-this-game), during review of its offline archive path with synthetic libraries and pair lists; no new gameplay or iPhone run. The empty pair list on [ANIMAL WELL](../../dm/games/010020D01AD24000/README.md#found-on-this-game).
 - **Check:** `dm/tools/tests/test_pso_offline.py` changes vertex and fragment library bytes without changing entries or stamps, and exercises the all-constant plan, the header-only pair list and pairs all left out. `t_pso_bundle` rejects bare headers, truncated archives, malformed load commands and out-of-range universal slices, accepts real offline and serialized archives, and rejects zero-probe coverage.
 
+### Fork experiment: deferred device pull-only pipeline archives
+
+`DM_PSO_LAZY_DEVICE_ARCHIVES=1` keeps device `p<seq>.mtl4a` files closed while a usable bundled archive supplies every requested base. The default remains eager loading. Device files that can contain vertex layouts stay eager because their startup list also controls compaction, and those files can contain bases without a layout too.
+
+The first no-layout draw or prebuild pair that misses the bundle opens the deferred files once. Every reader receives the same immutable array after `dispatch_once` completes. The existing fallback order, capture path and mixed-file compaction remain in place. Startup reserves every existing filename's sequence number before any capture can flush, including files it hasn't opened yet. A bundle that is missing, unusable or disabled keeps the existing eager path.
+
+The log records the deferred file count and the time and bytes opened on the first miss. These are archive-open observations; no game startup improvement or resident-memory reduction has been measured. A function-constant remainder can trigger the fallback during prebuild, so some games may open the files shortly after startup anyway.
+
+Checks: `t_pso_bundle` passes 67 checks in default and opt-in modes with real generated Metal archives, including a covered draw that leaves the files closed, a real subset-bundle miss served by the device archive, and a capture that preserves the old file and uses the next sequence. `t_pso_archive` passes 74 checks in each mode without a bundle, including vertex-layout lookup, mixed captures, concurrency and compaction. Its fresh-process seed, replay and verification matrix also passes in each mode, with and without function constants. These are Mac synthetic GPU tests; Newt game and footprint comparisons remain pending.
+
 ### Metal's build folders left by pipeline archive flushes
 
 - **Symptom:** the user cache folder (`getconf DARWIN_USER_CACHE_DIR`, then `com.apple.gpuarchiver/`) fills with `gpuarchiver-*` folders of 0.3–5 MB each, one per pipeline archive flush (456 folders, 2.5 GB after two days). Later folders are larger, up to about 127 MB (an M4 Pro, 2026-10-29: 19 GB in 423 folders after a day of Mac runs and regression checks); why they grew is **open**. A later compile can fail with `cannot open '…/gpuarchiver-…/PersistentState': No such file or directory`.
