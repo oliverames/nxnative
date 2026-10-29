@@ -56,10 +56,21 @@ static void checkSize(DmRootVC *root, CGSize size) {
     [super scene:scene willConnectToSession:session options:options];
     DmRootVC *root = (DmRootVC *)self.window.rootViewController;
     root.launched = YES;
+    // The production root deliberately has no ROM here. Replace its game-file
+    // hint before the first screen is shown so this probe cannot look like a
+    // broken game installation.
+    for (UIView *view in root.view.subviews.copy) [view removeFromSuperview];
+    UILabel *status = [[UILabel alloc] initWithFrame:CGRectInset(root.view.bounds, 32, 32)];
+    status.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    status.numberOfLines = 0; status.textAlignment = NSTextAlignmentCenter;
+    status.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle2];
+    status.textColor = UIColor.whiteColor;
+    status.text = @"Verification app\nNo game files are used.\nRunning display checks.";
+    [root.view addSubview:status];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         checks = [NSMutableArray array];
         root.game = [[DmGameView alloc] initWithFrame:root.view.bounds];
-        [root.view addSubview:root.game];
+        [root.view insertSubview:root.game atIndex:0];
         g_layer = (CAMetalLayer *)root.game.layer; g_root = root;
         CGSize original = root.view.bounds.size;
         for (NSValue *size in @[[NSValue valueWithCGSize:CGSizeMake(390,844)],
@@ -92,7 +103,12 @@ static void checkSize(DmRootVC *root, CGSize size) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 check(@"a worker reads the published refresh without UIKit", fps == metrics.max_fps);
                 NSInteger failed = 0; for (NSDictionary *item in checks) if (![item[@"passed"] boolValue]) failed++;
+                status.text = [NSString stringWithFormat:@"Verification app\nNo game files are used.\nVerification %@.\n%lu display checks, %ld failed.\n%@",
+                    failed ? @"failed" : @"passed", (unsigned long)checks.count, (long)failed,
+                    edr ? @"Mode: experimental EDR." : @"Mode: default SDR."];
+                [root.view bringSubviewToFront:status];
                 NSDictionary *report = @{@"checks":checks, @"failed":@(failed), @"externalDisplayTested":@NO,
+                    @"displayMessage":status.text,
                     @"EDROutputEnabled":@(edr), @"scale":@(metrics.scale), @"width":@(metrics.width), @"height":@(metrics.height),
                     @"maximumFPS":@(metrics.max_fps), @"currentEDRHeadroom":@(metrics.headroom), @"potentialEDRHeadroom":@(metrics.potential_headroom),
                     @"systemVersion":UIDevice.currentDevice.systemVersion};
