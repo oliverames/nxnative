@@ -41,6 +41,10 @@ static void guest_addr(void *g, uint32_t ip, uint16_t port) {   // Horizon SockA
     uint32_t a = htonl(ip); memcpy((char *)g + 4, &a, 4);
 }
 int main(void) {
+    unsigned (*handle_error)(void) = hook("_ZN2nn4nifm31HandleNetworkRequestErrorResultEv");
+    if (!handle_error) return 1;
+    setenv("DM_NET", "0", 1);
+    CHECK(handle_error() == 0, "offline nifm network screen did not resolve the error");
     setenv("DM_NET", "1", 1);
     setenv("DM_NET_PEERS", getenv("T_NET_PEER") ? getenv("T_NET_PEER") : "127.0.0.1", 1);   // T_NET_PEER: test the replication over a real interface (e.g. the tailnet's)
     int (*sock)(int, int, int) = hook("_ZN2nn6socket6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE");
@@ -128,6 +132,7 @@ int main(void) {
     CHECK(select_(b + 1, rset, NULL, NULL, tv) == 1, "Select readable");
     CHECK(close_(a) == 0 && close_(b) == 0, "Close");
 
+    CHECK(handle_error() == 0, "online nifm network screen did not resolve the error");
     CHECK(netavail() == 1, "nifm IsNetworkAvailable");
     uint32_t ip = 0, mask = 0, gw = 0, d0 = 0, d1 = 0;
     CHECK(ipcfg(&ip, &mask, &gw, &d0, &d1) == 0 && ip != 0 && mask != 0, "nifm IpConfigInfo");
