@@ -95,15 +95,20 @@ int main(void) { @autoreleasepool {
     NSString *rest = [NSString stringWithContentsOfFile:[bundle stringByAppendingPathComponent:@"rest_pairs.tsv"] encoding:NSUTF8StringEncoding error:nil];
     EXPECT("bundle: one pair left to the device", 1, [rest isEqualToString:@"v1\tfc\n"]);
     setenv("DM_PSO_BUNDLE", bundle.UTF8String, 1);
+    // A prior device p file with a nonzero sequence: covered draws must not
+    // need its mapping in lazy mode, and captures must never overwrite it.
+    [NSFileManager.defaultManager createDirectoryAtPath:arch withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *seed = [arch stringByAppendingPathComponent:@"p00007.mtl4a"];
+    EXPECT("device fixture: seeded", 1, [archiveBytes writeToFile:seed atomically:YES]);
     shmap_load(); pso4_init();
+    const char *lazy_env = getenv("DM_PSO_LAZY_DEVICE_ARCHIVES");
+    int lazy = lazy_env && !strcmp(lazy_env, "1");
+    EXPECT("device archives: existing sequence reserved before capture", 8, g_arch_seq);
+    EXPECT("device archives: default eager, opt-in deferred", lazy ? 1 : 2, g_arch4p.count);
+    EXPECT("device archives: deferred paths immutable", lazy ? 1 : 0, g_arch4p_deferred.count);
+    EXPECT("device archives: no deferred mapping at startup", 0, g_arch4p_late.count);
     EXPECT("bundle: opened", 1, g_arch_bundle != nil);
     EXPECT("bundle: first among the files without a vertex layout", 1, g_arch4p.count && g_arch4p[0] == g_arch_bundle);
-    // its stamp matches: only the pair with function constants is built here
-    reset_counts();
-    EXPECT("covered: one pair built on the device", 1, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
-    EXPECT("covered: its base compiled", 1, g_pre_built);
-    EXPECT("covered: nothing else", 0, g_pre_archived + g_pre_skipped + g_pre_failed);
-    EXPECT("covered: again, nothing to do", -1, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
     // a draw of a covered pair (its pulling pipeline, as pso_desc_pull makes it) takes the base from the bundle: nothing compiled, nothing captured for the device's own archive
     @autoreleasepool {
         id<MTLLibrary> vl = lib_from_file([msl stringByAppendingPathComponent:@"v1_bp.metallib"], NULL), fl = lib_from_file([msl stringByAppendingPathComponent:@"f1_b.metallib"], NULL);
@@ -115,7 +120,44 @@ int main(void) { @autoreleasepool {
         EXPECT("covered draw: its base from the bundle", arch0 + 1, g_pb_archived);
         EXPECT("covered draw: none compiled", built0, g_pb_built);
         EXPECT("covered draw: nothing captured for the device's archive", new0, g_arch_new);
+        EXPECT("covered draw: deferred archives remain unopened", 0, g_arch4p_late.count);
     }
+    // A real subset bundle misses f2, which remains in the real device file.
+    // This is the first uncovered draw: no parallel archive implementation.
+    {
+        NSString *partial = [root stringByAppendingPathComponent:@"partial-bundle"];
+        put([tables stringByAppendingPathComponent:@"partial.tsv"], @"v1\tf1\n");
+        EXPECT("fallback fixture: subset archive built", 0, sh([NSString stringWithFormat:
+            @"python3 %@ --platform macos --gpu %@ --msl %@ --pairs %@/partial.tsv --out %@ --work %@/partial-work > %@/partial.log 2>&1",
+            tool, gpu, msl, tables, partial, root, root]));
+        id<MTL4Archive> subset = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:[partial stringByAppendingFormat:@"/%@.mtl4a", gpu]] error:nil];
+        EXPECT("fallback fixture: usable subset bundle", 1, subset != nil);
+        NSArray *saved = g_arch4p; id<MTL4Archive> saved_bundle = g_arch_bundle;
+        g_arch_bundle = subset;
+        g_arch4p = [@[subset] arrayByAddingObjectsFromArray:[saved subarrayWithRange:NSMakeRange(1, saved.count - 1)]];
+        id<MTLLibrary> vl = lib_from_file([msl stringByAppendingPathComponent:@"v1_bp.metallib"], NULL);
+        id<MTLLibrary> fl = lib_from_file([msl stringByAppendingPathComponent:@"f2_b.metallib"], NULL);
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = fn4_note([vl newFunctionWithName:@"main0"], vl, @"main0", nil);
+        d.fragmentFunction = fn4_note([fl newFunctionWithName:@"main0"], fl, @"main0", nil);
+        d.vertexDescriptor = [MTLVertexDescriptor vertexDescriptor]; d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        uint64_t built0 = g_pb_built, archived0 = g_pb_archived;
+        EXPECT("bundle miss: pipeline from device fallback", 1, pso_build(d, NULL) != nil);
+        EXPECT("bundle miss: actual archive hit", archived0 + 1, g_pb_archived);
+        EXPECT("bundle miss: no unnecessary compile", built0, g_pb_built);
+        EXPECT("bundle miss: deferred archive opened", lazy ? 1 : 0, g_arch4p_late.count);
+        NSArray *opened = pso_device_pull_archives();
+        EXPECT("bundle miss: later readers share immutable opened snapshot", 1, pso_device_pull_archives() == opened);
+        g_arch_bundle = saved_bundle; g_arch4p = saved;
+    }
+    // its stamp matches: only the pair with function constants is built here
+    reset_counts();
+    EXPECT("covered: one pair built on the device", 1, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
+    EXPECT("covered: its base compiled", 1, g_pre_built);
+    EXPECT("covered: nothing else", 0, g_pre_archived + g_pre_skipped + g_pre_failed);
+    EXPECT("covered: again, nothing to do", -1, pso_prebuild(1, 1, QOS_CLASS_USER_INITIATED));
+    EXPECT("device archive: old sequence never overwritten", 1, [[NSData dataWithContentsOfFile:seed] isEqualToData:archiveBytes]);
+    EXPECT("device archive: capture uses next reserved sequence", 1, [NSFileManager.defaultManager fileExistsAtPath:[arch stringByAppendingPathComponent:@"p00008.mtl4a"]]);
     // the near = 0 depth mode: not what the archive was made for, so the device's prebuild runs, and its main0_z bases are not in the archive
     [NSFileManager.defaultManager removeItemAtPath:[arch stringByAppendingPathComponent:@"prebuilt.tsv"] error:nil];
     reset_counts(); atomic_store(&g_depth_zero, 1);
@@ -133,7 +175,7 @@ int main(void) { @autoreleasepool {
     // a matching stamp but an archive without the bases (here: one of the device's own files): the probe finds none, so it is not trusted
     @autoreleasepool {
         NSString *txt = [NSString stringWithContentsOfFile:[tables stringByAppendingPathComponent:@"shader_pairs.tsv"] encoding:NSUTF8StringEncoding error:nil];
-        NSString *own = [arch stringByAppendingPathComponent:[[[NSFileManager.defaultManager contentsOfDirectoryAtPath:arch error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self BEGINSWITH 'p' AND self ENDSWITH '.mtl4a'"]] firstObject]];
+        NSString *own = [arch stringByAppendingPathComponent:@"p00008.mtl4a"];   // the device-only function-constant pair, not the seeded full bundle
         id<MTL4Archive> real = g_arch_bundle; NSError *e = nil;
         g_arch_bundle = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:own] error:&e];
         EXPECT("archive guard: real serialized archive accepted", 1, arch_file_ok(own));
