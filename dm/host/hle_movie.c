@@ -607,7 +607,9 @@ HLE_FORCE("_ZN5movie7Decoder5ResetEv", "movie decoder reset", int, h_movie_Reset
 HLE_FORCE("_ZN5movie7Decoder5FlushEv", "movie decoder flush: all inputs and outputs returned", int, h_movie_Flush, void **self) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
     MD_TRACE(d, 5, "Flush"); md_defer_drop(d); md_reset(d, 0);
-    if (d->vb) { dm_host_lock(&d->dmu); stb_vorbis_flush_pushdata(d->vb); pthread_mutex_unlock(&d->dmu); }   // a seek: start the overlap afresh
+    // A seek: start the overlap afresh. The decoder is closed and the next packet opens it again from the headers (md_vorbis_open). stb_vorbis_flush_pushdata is not used: it leaves the decoder looking for the next Ogg page
+    // in the stream, and md_vorbis hands it one whole page per call, so it never gave a sample again (Smash: the opening movie lost its sound for good after the first Flush)
+    if (d->vb) { dm_host_lock(&d->dmu); stb_vorbis_close(d->vb); d->vb = NULL; pthread_mutex_unlock(&d->dmu); }
     return 0;
 }
 HLE_FORCE("_ZN5movie7Decoder23AcquireInputBufferIndexEPiS1_", "movie decoder: acquire a free input index", int, h_movie_AcqIn, void **self, int *idx, int *left) {
