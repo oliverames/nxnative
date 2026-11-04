@@ -90,3 +90,7 @@ Each step below stopped the boot before its fix:
 - [Upsample pass reading the level above the one it renders](../../../docs/reference/rendering.md#upsample-pass-reading-the-level-above-the-one-it-renders): the stage intro's neon letters came out fat and filled, the bloom's upsample reading a sharper level through the view of the levels below (PR #1073).
 - [Present snapshots: the game's swapchain texture free at once](../../../docs/reference/frame-rate.md#present-snapshots-the-games-swapchain-texture-free-at-once): at the 30 fps cap with snapshots on it ran 43-65 fps of game time (fast-forward) and dropped about 110 of every 300 frames (PR #1073).
 - [Submissions handed to the GPU in segments](../../../docs/reference/frame-rate.md#submissions-handed-to-the-gpu-in-segments): a submission drawing into the target it inherited left those draws out of the segment's draw count (PR #1073).
+
+### Acquire-wait diagnostic correction
+
+A 350-second gameplay trace on iPhone 17 Pro Max, using a combined experimental renderer, exposed [incorrect acquire-wait telemetry](../../../docs/reference/frame-rate.md#acquire-wait-telemetry-measures-elapsed-pacing-time). `@wait_ms` now measures elapsed pacing wait. This diagnostic correction changes no rendering or pacing behavior; that phone trace is not verification of this exact source head.

@@ -402,3 +402,10 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Cause:** the thread that acquires the window (here the render thread) runs under a time-constraint policy whose computation the host re-declares every 120 frames; it was 1.25 × the 90th percentile of that thread's CPU time per frame. This render thread needs 1.9–2.0 ms a frame with one or two frames in 120 near 4.4 ms, against 2.5 ms declared, and each frame past the declaration stalled the thread. Probes on both threads' waits showed the main thread's waits; adding probes slowed the render thread and the stalls vanished, and `DM_RT=0` or a fixed `DM_RT_COMP=5` / `10` removed them too (99th percentile 18–21 ms) at the same CPU energy.
 - **Fix:** the declaration also covers 1.1 × the window's peak (`rt_comp_tick` in `hle_nvn.c`): 5.6 ms here, 60.0 fps, 99th percentile 21 ms.
 - **Found on:** [DARK SOULS: REMASTERED](../../dm/games/01004AB00A260000/README.md), in the Asylum cell.
+
+## Acquire-wait telemetry measures elapsed pacing time
+
+- **Symptom:** `DM_NVN_TSV` reports zero `@wait_ms` when acquire blocks on a display-link tick, or reports the planned fallback delay instead of the elapsed wait.
+- **Cause:** `nvnWindowAcquireTexture` accumulated `wait`, computed from the texture's fallback availability deadline, even when display-link pacing took a different path.
+- **Fix:** accumulate the already measured `pace_ns`, including snapshot-capacity waiting. Present-queue waiting remains separate in `@pq_wait_ms`. This changes diagnostics only; it does not change the wait, frame rate or presentation policy. The controlled-clock `t_link_ticks` case has a zero fallback deadline and a nonzero display-link wait.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md), while analyzing a 350-second physical iPhone 17 Pro Max trace from a combined experimental build. Older `@wait_ms` values must not be treated as measured blocked time. This correction does not establish the cause of its pacing dips or improve performance.
