@@ -28,16 +28,23 @@ def nrr_hashes(romfs, only=None):
     for dp, _, fs in os.walk(romfs):
         for f in sorted(fs):
             if not f.endswith('.nrr') or (only and f != only): continue
-            d = open(os.path.join(dp, f), 'rb').read()
-            if d[:4] != b'NRR0': continue
-            # The Switch 1 NRR keeps (hash-table count, count) at 0x340; the Switch 2 revision keeps them further out (0x4Cx), where the Switch 1 read lands in other data:
-            # a plain 0x340 read of one gave count 0x4df48cf0. Revisions first, then 0x340: the first parse whose (off, cnt) is plausible within the file wins.
-            for o, c in ((0x4C0, 0x4C4), (0x4C4, 0x4C0), (0x340, 0x344)):
-                off = struct.unpack_from('<I', d, o)[0]; cnt = struct.unpack_from('<I', d, c)[0]
-                if 0 < cnt < (1 << 20) and cnt * 32 <= len(d) - off:
-                    for i in range(cnt): out.setdefault(d[off + 32 * i:off + 32 * i + 32], f)
-                    break
-            else: sys.exit(f'{f}: no plausible hash layout ((count, table offset) at 0x340 or 0x4Cx); not a Switch 1 NRR and not the Switch 2 one')
+            with open(os.path.join(dp, f), 'rb') as stream: d = stream.read()
+            if len(d) < 0x21 or d[:4] != b'NRR0':
+                sys.exit(f'{f}: invalid NRR header: magic={d[:4].hex()}, size={len(d):#x}')
+            # The SDK checks these three bytes before selecting its metadata, not the hash-table contents.
+            # Fever SDK build 32a9ac1480a6f0e9e2e8a813ae9cd73181897bb0: accessor at +0x158660.
+            # Field names are not established; byte +4 is not a layout version (legacy sign-key generation).
+            layout = (d[6], d[5], d[0x20])
+            meta = {(0, 0, 0): 0x330, (1, 1, 1): 0x4B0}.get(layout)
+            if meta is None:
+                sys.exit(f'{f}: unsupported NRR header: bytes[0x06,0x05,0x20]={layout}')
+            if len(d) < meta + 0x20:
+                sys.exit(f'{f}: truncated NRR header: layout={layout}, size={len(d):#x}, need={meta + 0x20:#x}')
+            size = struct.unpack_from('<I', d, meta + 8)[0]
+            off, cnt = struct.unpack_from('<II', d, meta + 0x10)
+            if not meta + 0x20 <= size <= len(d) or not meta + 0x20 <= off <= size or cnt > (size - off) // 32:
+                sys.exit(f'{f}: invalid NRR hash bounds: layout={layout}, size={size:#x}, file={len(d):#x}, offset={off:#x}, count={cnt}')
+            for i in range(cnt): out.setdefault(d[off + 32 * i:off + 32 * i + 32], f)
     return out
 
 
