@@ -1600,3 +1600,11 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** `t_host_msl` loads every library, with a swizzled `newLibraryWithSource:` that counts 0 calls, and finds all 24 clear functions. `t_builtin`, `t_geometry` and `t_deswz_gpu` use the built libraries.
 - **Build inputs:** Mac libraries use `MACOS_MIN` from `dm/mac/min_os.mk`, matching the host's deployment target; otherwise a newer SDK emits libraries older supported Macs cannot load and the host falls back to runtime compilation. Every build rechecks the compiler, SDK, deployment target and source contents, reusing the header only when all match. Installing the Metal toolchain after a source-only build therefore regenerates the libraries without a clean build.
 - **Build callers:** the NSP packer and regression harness generate the Mac header before checking their cached host executables, and include it in the host fingerprint. The standalone iOS compile check generates the iPhone header before its dry run, as the app build does. A dry run alone does not generate either header.
+
+
+### NVN2 push constants missing from a binding capture
+
+- **Symptom:** a pass dump identifies a shader that reads c24, but `DM_NVN_CBDUMP` produces no matching constant bytes, leaving a shader replay dependent on assumed values.
+- **Cause:** NVN2 c24 comes from the current graphics or compute push-constant block, not an ordinary uniform-buffer binding. The uniform-buffer dump did not cover that binding kind.
+- **Fix:** with `DM_NVN_PASSDUMP`, log the first four c24 floats in hexadecimal and save the full block copied to the argument arena when `DM_NVN_CBDUMP` is set. `DM_NVN_CBDUMP_KEY` selects the exact shader key, as for uniform-buffer dumps. Files include frame, pass, draw counter and stage. The existing pass-dump policy captures the first binding encode per stage in a pass; use `DM_NVN_PASSDUMP_ALL` for every encode. Capturing changes timing and is not a performance measurement.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md), investigating spatial AA on iPhone 17 Pro Max. The earlier raw-texture replay assumed reciprocal-dimension c24 values; it did not measure them or demonstrate an AA defect. The new diagnostic still requires a fresh on-device game capture.
