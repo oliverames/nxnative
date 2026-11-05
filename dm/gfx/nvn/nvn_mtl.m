@@ -2885,8 +2885,10 @@ uint64_t mtl_pkg_edge_skips(void) { return g_pkg_edge_skips; }
 uint64_t mtl_pkg_miss(void) { return g_pkg_miss; }
 void mtl_vc_drop(uint64_t ser);
 static void treg_retire_serial(uint64_t ser);
+static void wc_forget(uint64_t wser);
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
+    wc_forget(t->serial);
     pthread_mutex_lock(&g_smu); nvn_hm_del(&g_tex_live, &t->serial); free(nvn_hm_del(&g_image_desc, &t->serial));
     pthread_mutex_lock(&g_cpu_tex_mu);
     void *pool = nvn_hm_del(&g_cpu_tex, &t->serial);
@@ -3271,6 +3273,76 @@ static int tbdr_on(void);
 static int xv_on(void) { static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_XV"); off = e && !strcmp(e, "0"); } return !off && tbdr_on(); }
 void mtl_xv_window_tex(uint64_t serial) { if (!xv_present(serial) && g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = serial; }   // Window (swapchain) texture: never enters the ledger
 void xv_test_counts(int *dc, int *viol) { if (dc) *dc = (int)g_xv_dc; if (viol) *viol = (int)g_xv_viol; }
+// ---------- Window copy at the drawable's size (DM_NVN_WINDOW_COPY=[verify:]<fragment key>[,<fragment key>...]) ----------
+// Donkey Kong Bananza draws its picture at 2304x1296 and its last pass samples that into a 2880x1620 window texture (a fixed game constant); the present then scales the window texture to the drawable
+// (2346x1320 on an iPhone 17 Pro Max): two resamples. When the window's last pass is one draw of an allowlisted pure-copy fragment shader that covers the whole window (wc_try proves the rest), that pass is
+// drawn instead into a host texture P of the size the present would scale the window to (present_viewport: the drawable, letterboxed), with the draw's viewport scaled to match. The shader and the render
+// target view (sRGB encode on write) are the game's own; only the target's size changes. The present of that window texture then shows P (wc_take), which it samples one to one.
+// P belongs to one window texture, as a snapshot slot belongs to its ring entry: the game gets the window texture back only when its present is done, so P is not drawn into while a queued present still reads it.
+// The window texture itself is not written in such a frame. Anything that could read or later write it is refused up front (wc_try); one that comes later (wc_touch_) can only be detected: the redirected frame
+// is not materialized back into the window texture, so the access sees stale contents and the game may carry them into later state. That stops the feature and logs [RED]; it is a fail-stop diagnostic, not a
+// safe fallback, and the run's output is not to be trusted after it. P is never read except by the present. verify: evaluates every gate and logs, but draws as before.
+typedef struct { uint64_t wser, pser, pending; NSUInteger ww, wh, pw, ph; } wc_ent;
+static wc_ent g_wc[8]; static _Atomic int g_wc_n, g_wc_off; static pthread_mutex_t g_wc_mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_wc_redirected;
+// A queued present owns its target through GPU feedback, including the resolve/commit gap.
+typedef struct wc_owner { uint64_t serial; unsigned present_refs; int retired; struct wc_owner *next; } wc_owner;
+static wc_owner *g_wc_owners;
+static void wc_release(uint64_t serial) {
+    if (!serial) return;
+    uint64_t dead = 0;
+    pthread_mutex_lock(&g_wc_mu);
+    for (wc_owner **p = &g_wc_owners; *p; p = &(*p)->next) if ((*p)->serial == serial) {
+        wc_owner *o = *p; if (o->present_refs) o->present_refs--;
+        if (o->retired && !o->present_refs) { dead = o->serial; *p = o->next; free(o); } break;
+    }
+    pthread_mutex_unlock(&g_wc_mu);
+    if (dead) serial_del(dead);
+}
+// Called under g_wc_mu; deletion itself must occur after unlocking.
+static uint64_t wc_retire(uint64_t serial) {
+    for (wc_owner **p = &g_wc_owners; *p; p = &(*p)->next) if ((*p)->serial == serial) {
+        wc_owner *o = *p; o->retired = 1;
+        if (!o->present_refs) { *p = o->next; free(o); return serial; } break;
+    }
+    return 0;
+}
+static id<MTLTexture> g_wc_base; static uint64_t g_wc_wser; static wc_ent *g_wc_cur;   // the target for the pass about to open (attach) and the window serial it replaces; g_wc_cur: the redirected pass that is open
+static int g_wc_ndraw; static double g_wc_sx, g_wc_sy;   // draws of the redirected pass so far; the scale from window texture pixels to host target pixels (copied at the pass's start: the table entry can go with the window texture)
+static void wc_poison(const char *why, uint64_t ser) {
+    if (atomic_exchange(&g_wc_off, 1)) return;
+    MLOG("[RED] window copy: %s (window texture %llu) after its picture went to the host target: the feature is stopped for the rest of the run. This is a fail-stop diagnostic, NOT a fallback: the window texture "
+         "lacks the redirected frames' picture, so whatever read or copied it saw stale contents, and anything the game derived from that may persist past the stop. Treat the run as invalid", why, (unsigned long long)ser);
+}
+// Anything outside the redirected pass that reads or writes a tracked window texture: read != 0 reads it (a descriptor pool registration, a copy out, a CPU readback), a write is wrong only while this frame's picture is in P
+static void wc_touch_(uint64_t ser, const char *why, int read) {
+    if (atomic_load(&g_wc_off)) return;
+    int bad = 0; pthread_mutex_lock(&g_wc_mu);
+    for (int i = 0; i < 8; i++) if (g_wc[i].wser == ser && g_wc[i].wser) bad = read || g_wc[i].pending;
+    pthread_mutex_unlock(&g_wc_mu);
+    if (bad) wc_poison(why, ser);
+}
+#define wc_touch(t, why, read) do { if (atomic_load_explicit(&g_wc_n, memory_order_relaxed) && (t)) wc_touch_((t)->serial, (why), (read)); } while (0)
+// The present of window texture wser: the serial of the host target holding its picture (0 = present the window texture itself), and the crop scaled to it. Clears pending either way: a frame boundary
+static uint64_t wc_take(uint64_t wser, const int crop[4], int out[4]) {
+    uint64_t p = 0; wc_ent e = {0};
+    pthread_mutex_lock(&g_wc_mu);
+    for (int i = 0; i < 8; i++) if (g_wc[i].wser == wser && wser) { p = g_wc[i].pending; g_wc[i].pending = 0; e = g_wc[i]; if (p) for (wc_owner *o = g_wc_owners; o; o = o->next) if (o->serial == p) { o->present_refs++; break; } }
+    pthread_mutex_unlock(&g_wc_mu);
+    memset(out, 0, 4 * sizeof *out);
+    if (!p || !crop || !(crop[2] || crop[3]) || (!crop[0] && !crop[1] && (NSUInteger)crop[2] == e.ww && (NSUInteger)crop[3] == e.wh)) return p;
+    double sx = (double)e.pw / e.ww, sy = (double)e.ph / e.wh;   // a crop of the window texture: the same part of P, to the pixel
+    out[0] = (int)lround(crop[0] * sx); out[1] = (int)lround(crop[1] * sy); out[2] = MAX(1, (int)lround(crop[2] * sx)); out[3] = MAX(1, (int)lround(crop[3] * sy));
+    if ((NSUInteger)out[0] + out[2] > e.pw) out[2] = (int)e.pw - out[0]; if ((NSUInteger)out[1] + out[3] > e.ph) out[3] = (int)e.ph - out[1];
+    static int once; if (!once++) MLOG("window copy: crop %d,%d %dx%d of the window texture scaled to %d,%d %dx%d of the host target", crop[0], crop[1], crop[2], crop[3], out[0], out[1], out[2], out[3]);
+    return p;
+}
+static void wc_forget(uint64_t wser) {
+    uint64_t dead = 0;
+    pthread_mutex_lock(&g_wc_mu);
+    for (int i = 0; i < 8; i++) if (g_wc[i].wser == wser && wser) { dead = wc_retire(g_wc[i].pser); g_wc[i] = (wc_ent){0}; atomic_fetch_sub(&g_wc_n, 1); }
+    pthread_mutex_unlock(&g_wc_mu);
+    if (dead) serial_del(dead);
+}
 static void sd_finish(void);
 // Load elision (fully covering first draw): if the draw that opens the pass can be proven to cover a color attachment in full (first_draw_covers), that attachment's load becomes DontCare -
 // the first draw does not blend and writes all channels, every covered pixel is rewritten by it, and the original content is not visible (Switch immediate-mode rendering has no such cost; on TBDR load = reading the whole thing from memory into the tile)
@@ -3347,7 +3419,7 @@ static void rp_end(void) { if (g_enc) { AP_B; geo_mesh_flush_pass();
     int ranged=g_rt_range_active && !g_rt_range_pending;
 #endif
     sd_finish(); enc_r_end_pass(g_enc); g_gp_bw_l0 = g_bw_load; g_gp_bw_s0 = g_bw_store;   // the profile's per-pass ledger counts from the previous pass end, profiled or not
-    zskip_commit_clears(); g_enc = nil; g_enc_geo_nocolor = 0; g_rt_merged = 0; g_sm_pass = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
+    zskip_commit_clears(); g_enc = nil; g_wc_cur = NULL; g_enc_geo_nocolor = 0; g_rt_merged = 0; g_sm_pass = 0; g_rt_range_active = g_rt_range_pending = 0; pg_end_render(); ts_after(); ms_after(); if (g_lp.count) lp_finish(); fz_end();
     if (g_nubd && g_nubd >= ubd_lazy()) ubd_flush();   // the inline updates deferred in this pass, in order (see mtl_sub_update); across passes they wait for the next copy or dispatch (blit_raw)
     if (g_nbcrt) bcrt_flush();   // blocks drawn into shadows go back into their compressed textures
     if (g_nrtm) rt_mirror_flush();
@@ -3462,7 +3534,7 @@ static NSUInteger att_layers(MTLRenderPassAttachmentDescriptor *a, const view_t 
     return MAX(n, 1u);
 }
 static void attach(MTLRenderPassAttachmentDescriptor *a, const tex_t *t, const view_t *v, int has_v) {
-    id<MTLTexture> base = tex_mtl(t);
+    id<MTLTexture> base = g_wc_base && t->serial == g_wc_wser ? g_wc_base : tex_mtl(t);   // g_wc_base: the host target a redirected window pass draws into (wc_try)
     // A texture made without render-target use (packaged or CPU-written, uploaded from its storage) drawn into: give it that use, as a clear of one does (clear_tex). Metal's validation
     // stops at such an attachment; without it Tears of the Kingdom drew its terrain normal maps into textures made for reading only
     if (base && !(base.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(base.pixelFormat) && base.sampleCount == 1) base = tex_upgrade(t, base, MTLTextureUsageRenderTarget, base.pixelFormat);
@@ -3495,6 +3567,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex(int clear_only) { AP_B; id<MTL4R
 static void bare_dims(NSUInteger *w, NSUInteger *h);
 static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
     if (g_enc) return g_enc;
+    // Encoder splits retain R.rt: a later clear/draw need not issue another OP_SET_RT.
+    for (int i = 0; atomic_load_explicit(&g_wc_n, memory_order_relaxed) && i < R.rt.n && i < 8; i++)
+        wc_touch(R.rt.color[i], "reopened as a render target before present", 0);
     memset(g_zskip_cand_ok, 0, sizeof g_zskip_cand_ok);
     g_enc_mode = clear_only; g_enc_geo_nocolor = g_geo_omit_colors; g_pass_swrite = g_pass_order = g_pass_late_res = 0; g_sm_pass = 0;
     if (!R.has_rt) { RED_ONCE(3, "no render target set before the draw"); return nil; }
@@ -3527,6 +3602,7 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
             else pd.colorAttachments[i].loadAction = MTLLoadActionDontCare;
             g_fd_n++;
         }
+        if (g_wc_base && R.rt.color[i]->serial == g_wc_wser && pd.colorAttachments[i].loadAction == MTLLoadActionLoad) pd.colorAttachments[i].loadAction = MTLLoadActionDontCare;   // wc_try proved the draw covers the whole window, so P is written whole
         xv_touch_add(R.rt.color[i]->serial, (uint32_t)pd.colorAttachments[i].level, (uint32_t)pd.colorAttachments[i].slice,
                      pd.colorAttachments[i].loadAction != MTLLoadActionLoad);
         if (g_xv_n) { xv_ent *xe = xv_find(R.rt.color[i]->serial, (uint32_t)pd.colorAttachments[i].level, (uint32_t)pd.colorAttachments[i].slice);
@@ -3704,9 +3780,9 @@ static id<MTL4RenderCommandEncoder> rp_begin_ex_(int clear_only) {
       void ms_note(id pd, NSUInteger nc); ms_note(pd, (NSUInteger)R.rt.n); }
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }   // the copy encoder the shadows' blocks were moved in with (bcrt_attach)
     ser_gate();
+    g_stat_pass++;   // gp_begin records this pass; match the attachment and draw dump labels
     g_enc = enc_r_begin_pass(pd);
     args_dirty_all();
-    g_stat_pass++;
     if (enc_label_on()) { id<MTLTexture> lt = pd.colorAttachments[0].texture ?: pd.depthAttachment.texture ?: pd.stencilAttachment.texture; g_el_w = (int)lt.width; g_el_h = (int)lt.height; g_el_draws = 0; g_el_key[0] = 0; }
     return g_enc;
 }
@@ -3840,6 +3916,7 @@ static void shmap_read(void) {
     NSString *ventry; id<MTLFunction> vfn; int vfn_state;
     id<MTLFunction> pfn; int pfn_state, has_pull;
     id<MTLFunction> afn[4]; int afn_state, has_alpha;
+    id<MTLFunction> bbfn[4]; int bbfn_state, has_border;   // bbfn: fn, fn_u, fn_m, fn_d of the border correcting library <key>_bb (bb_fn; bbfn_state as afn_state; has_border: the reflection names one, dmsh_build.py border_plain)
     id<MTLLibrary> llib; NSMutableDictionary<NSNumber *, id<MTLFunction>> *lfn; int lfn_state, has_logic; } @end   // llib: the logic operation library <key>_bl, lfn: its fn_u / fn_m specialized per set of targets (lo_fn; lfn_state as afn_state; has_logic: the reflection names one, dmsh_logic.py)   // afn: fn, fn_u, fn_m, fn_d of the alpha test library <key>_ba (at_fn; afn_state 0 untried, 1 loaded, 2 failed; has_alpha: the reflection names one, dmsh_alpha.py)   // pfn: the same entry of the pulling library <key>_bp (pull_fn; has_pull: the reflection names one, dmsh_pull.py)   // vertex: the entry point loaded (by the depth mode); vfn: the same entry of the shadow-input library <key>_bv (vin_fn; state 0 untried, 1 loaded, 2 failed)
 @implementation NvShader
 - (void)dealloc { free(rf.c1); free(geo_slot); }
@@ -4082,6 +4159,7 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     if (stage == 0 && !layer) o->has_pull = [j[@"pull"] isKindOfClass:[NSDictionary class]];
     if (stage == 1) o->has_alpha = [j[@"alpha"] isKindOfClass:[NSDictionary class]];
     if (stage == 1) o->has_logic = [j[@"logic"] isKindOfClass:[NSDictionary class]];
+    if (stage == 1) o->has_border = [j[@"border"] isKindOfClass:[NSDictionary class]];
     // A function that declares function constants cannot go into a pipeline until it is specialized, even when every constant is optional. SPIRV-Cross declares one for shaders that read a
     // texel buffer (spvLinearTextureAlignmentOverride, used only through is_function_constant_defined; one of Pokémon Legends: Z-A's imgui pixel shaders, 2bd5037003980716): an empty set of
     // values keeps its default. Without it the first pipeline with that shader failed Metal's validation (`fragmentFunction main0 cannot be used to build a pipeline state`)
@@ -4272,6 +4350,7 @@ static int *g_treg_transient; static size_t g_ntreg_transient, g_treg_transient_
 static _Atomic uint64_t g_tser[1 << 20];
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview: sampler ID → MTLSamplerState (retained)
 static void **g_sview_w; static uint64_t *g_srid_w; static float (*g_sbk)[4];   // a sampler's twin for a border colour Metal lacks (retained, NULL = none) and the shader's factors k (see nvn_border.h)
+static int g_ntwin;   // registered samplers whose border colour Metal lacks (nvn_border: they get a twin), counted by mtl_reg_samp under g_rmu; 0: border_key needs no look at the bindings
 // Memory pool Finalize: for texture IDs whose registered texture lives on this pool, drop the cached MTLTexture (view or base texture). The cache used to be released only when the ID was registered again,
 // so a linear texture built directly on a pool kept the whole pool buffer alive (6 to 17 finalized 16 MB pool buffers stayed alive in Engage's title demo). If the ID is still used, the next lookup rebuilds it on the slow path
 static void treg_drop_im(treg_t *r) { if (r->im) { defer_obj_unref((__bridge id)r->im); CFRelease(r->im); r->im = r->im_of = NULL; r->im_rid = 0; } }   // the image class view (img_fit)
@@ -4483,6 +4562,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
         if (id_ < (1 << 20)) atomic_store_explicit(&g_tser[id_], t ? t->serial : 0, memory_order_release);
     }
     os_unfair_lock_unlock(&g_rmu);
+    wc_touch(t, "registered in a descriptor pool (a draw could sample it)", 1);
     {   // DM_NVN_TREG_ID=n logs every registration of texture ID n: what it holds from then on, and when (the frame being recorded)
         static int want = -2; if (want == -2) { const char *e = getenv("DM_NVN_TREG_ID"); want = e ? atoi(e) : -1; }
         if (want == tid) MLOG("TREG id %d frame %llu %s ser=%llu %ux%u format=%#x target %d view %d", tid, (unsigned long long)atomic_load(&g_cur_frame), same ? "(the same)" : "→",
@@ -4515,6 +4595,9 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     if (g_sview_w[id_]) { CFRelease(g_sview_w[id_]); g_sview_w[id_] = NULL; g_srid_w[id_] = 0; }
     g_reg_gen++;
+    { int bn, bw; float k[4]; const samp_par *o = &g_sreg[id_];   // g_ntwin: the registration replaced, then this one
+      if (g_sreg_ok[id_] && nvn_border(o->border, (const uint8_t[3]){o->ws, o->wt, o->wr}, o->reduction, &bn, &bw, k)) __atomic_store_n(&g_ntwin, g_ntwin - 1, __ATOMIC_RELAXED);
+      if (nvn_border(sp->border, (const uint8_t[3]){sp->ws, sp->wt, sp->wr}, sp->reduction, &bn, &bw, k)) __atomic_store_n(&g_ntwin, g_ntwin + 1, __ATOMIC_RELAXED); }
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
     os_unfair_lock_unlock(&g_rmu);
 }
@@ -5649,6 +5732,34 @@ static id<MTLFunction> at_fn(NvShader *fs, id<MTLFunction> base) {   // the alph
     os_unfair_lock_unlock(&g_at_lock);
     return f;
 }
+// Border colours Metal lacks (dmsh_build.py border_emu, nvn_border.h): a pixel shader's main library is built without the correction (border_plain), which took registers in every
+// pixel for a branch almost never taken; its border correcting library <key>_bb has the same entry points and argument buffer with the correction. A pipeline drawn while one of the
+// shader's sampler members has a twin (border_key) takes its fragment from there
+static os_unfair_lock g_bb_lock = OS_UNFAIR_LOCK_INIT;
+static id<MTLFunction> bb_fn(NvShader *fs, id<MTLFunction> base) {   // the border correcting library's entry point named as base (one of fs's own), loaded on first need; a failure is final for the shader
+    int w = !base ? -1 : base == fs->fn ? 0 : base == fs->fn_u ? 1 : base == fs->fn_m ? 2 : base == fs->fn_d ? 3 : -1;
+    if (w < 0 || !fs->has_border) return nil;
+    os_unfair_lock_lock(&g_bb_lock);
+    if (!fs->bbfn_state) {
+        fs->bbfn_state = 2;
+        size_t kl = strlen(fs->key); NSString *path = [NSString stringWithFormat:@"%@/%.*s_bb.metallib", g_msl_dir, (int)(kl > 2 ? kl - 2 : kl), fs->key];
+        NSError *e = nil; id<MTLLibrary> lib = lib_from_file(path, &e); const char *why = lib ? NULL : "no library";
+        id<MTLFunction> own[4] = {fs->fn, fs->fn_u, fs->fn_m, fs->fn_d};
+        for (int i = 0; i < 4 && !why; i++) {
+            if (!own[i]) continue;
+            NSString *name = own[i].name; id<MTLFunction> f = fn4_note([lib newFunctionWithName:name], lib, name, nil);
+            if (f && f.functionConstantsDictionary.count) f = fn_spec(lib, name, [MTLFunctionConstantValues new], &e);   // as shader_load
+            if (!f) why = "no entry point";
+            else if (fs->rf.nb && [f newArgumentEncoderWithBufferIndex:fs->rf.abi].encodedLength != fs->arg_len) why = "its argument buffer differs from the base library's";
+            else fs->bbfn[i] = f;
+        }
+        if (!why) { fs->bbfn_state = 1; static int n; if (++n <= 3 || !(n & (n - 1))) MLOG("border colours: correcting library of %s loaded (%d shaders so far)", fs->key, n); }
+        else { static int n; if (n++ < 8) MLOG("[RED] border correcting library of %s not usable (%s%s%s): its draws take Metal's nearest border colour", fs->key, why, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); }
+    }
+    id<MTLFunction> f = fs->bbfn_state == 1 ? fs->bbfn[w] : nil;
+    os_unfair_lock_unlock(&g_bb_lock);
+    return f;
+}
 // The function and reference (dmsh_alpha.py dm_alpha_state) at fragment buffer DMSH_ALPHA_BUFFER: a copy in the frame arena per value and pass, since the pass's earlier draws
 // still read the one before
 static void at_bind(id<MTLCommandEncoder> en) {
@@ -5764,17 +5875,21 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     // Dual-source blending: target 0 reads the shader's output 1 as its second source. The dual-source entry point returns that output as [[color(0), index(1)]] (dmsh_build.py fs_dual),
     // and output 1 is then no colour output: Maxwell leaves the attachment of output 1 as it was. A shader without that entry point blends with zero for the second source, as an
     // unwritten one (blend_zero_src1): passing the state to Metal as it is makes Metal 4's blend compiler crash (MTLCompilerService in buildBlendFactor, Pokémon Legends: Arceus)
-    int dual = !k->logic && fs && !fsfn && fs->rf.color_known && (fs->rf.color_mask & 2) && d.fragmentFunction == fs->fn && pso_reads_src1(k, merged), dual_fn = 0;   // a logic operation takes the place of blending
+    int dual = !(k->logic & 1) && fs && !fsfn && fs->rf.color_known && (fs->rf.color_mask & 2) && d.fragmentFunction == fs->fn && pso_reads_src1(k, merged), dual_fn = 0;   // a logic operation takes the place of blending
     if (dual && fs->fn_d) { d.fragmentFunction = fs->fn_d; dual_fn = 1; }
     else if (dual) { want_note(&g_dual_want, fs->key);
         RED_ONCE(121, "shader %s writes output 1 and a pipeline blends with it as the second source, but it has no dual-source entry point: the second source counts as zero "
                  "(add its key to the profile's dual_want.tsv; DM_NVN_DUAL_WANT=<file> lists every such shader)", fs->key); }
+    if ((k->logic & 2) && fs && !k->atest && !(k->logic & 1)) {   // a border colour Metal lacks (border_key): the same entry point of the border correcting library; the alpha test and logic operation libraries correct it themselves (they are built from that source)
+        id<MTLFunction> bf = fsfn ? nil : bb_fn(fs, d.fragmentFunction);
+        if (bf) d.fragmentFunction = bf;
+    }
     if (k->atest && fs) {   // the alpha test (atest_key): the same entry point of the alpha test library
         id<MTLFunction> af = fsfn ? nil : at_fn(fs, d.fragmentFunction);
         if (af) d.fragmentFunction = af;
         else if (fsfn) RED_ONCE(129, "alpha test not applied to a specialized fragment (readable-tile merge or diagnostic) of %s", fs->key);
     }
-    if (k->logic && fs) {   // the logic operation (lop_key): the same entry point of the logic operation library; never with the alpha test's, which lop_key leaves out
+    if ((k->logic & 1) && fs) {   // the logic operation (lop_key): the same entry point of the logic operation library; never with the alpha test's, which lop_key leaves out
         uint32_t targets = 0; for (int i = 0; i < 8; i++) if (k->cfmt[i]) targets |= 1u << i;   // not a merged pass (lop_key): target i is output i
         id<MTLFunction> lf = fsfn ? nil : lo_fn(fs, d.fragmentFunction, targets);
         if (lf) d.fragmentFunction = lf;
@@ -5800,7 +5915,7 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         if (unwritten) m = 0;
         c.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
         // Integer targets: no blending. Maxwell ignores the blend enable on them; Metal refuses the pipeline (an assertion even without the API validation layer): Luigi's Mansion 3's integer G-buffer (PR #105)
-        if (!k->logic && l != 0xff && k->blend_en >> l & 1 && !unwritten && !pf_int_kind(c.pixelFormat)) {   // a logic operation takes the place of blending (lop_key)
+        if (!(k->logic & 1) && l != 0xff && k->blend_en >> l & 1 && !unwritten && !pf_int_kind(c.pixelFormat)) {   // a logic operation takes the place of blending (lop_key)
             c.blendingEnabled = YES; blend_st bl = adv_blend(k->blend[l]);
             if (fs && fs->rf.color_known && (!(fs->rf.color_mask & 2) || (dual && !dual_fn)) && !fsfn) {
                 bl.src_rgb = blend_zero_src1(bl.src_rgb); bl.dst_rgb = blend_zero_src1(bl.dst_rgb);
@@ -6279,13 +6394,29 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
 }
 static id<MTLRenderPipelineState> pso_build(MTLRenderPipelineDescriptor *d, NSError **e) { return pso_build_ex(d, e, 1); }
 // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
+static uint32_t ubo_handle(int stage, int reg, int off); static int ubo_samp_id(uint32_t h);
+// pso_key.logic bit 1: a sampler member of the pixel shader has a twin, so encode_args sets a bit of its border mask (the same test and sampler as there); 0 while no sampler has one
+static uint32_t border_key(NvShader *fs) {
+    if (!fs || !fs->has_border || !__atomic_load_n(&g_ntwin, __ATOMIC_RELAXED)) return 0;
+    uint32_t on = 0;
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < fs->rf.nb && !on; i++) {
+        const nvn_rbind *b = &fs->rf.b[i]; int reg = b->reg;
+        if (!b->bw || !(b->kind == NVN_RB_SAMP || b->kind == NVN_RB_SAMPT || b->kind == NVN_RB_SAMPU || b->kind == NVN_RB_SAMPI)) continue;
+        int sid = b->kind == NVN_RB_SAMPU ? ubo_samp_id(ubo_handle(1, reg, b->off)) :
+                  b->kind == NVN_RB_SAMPI ? reg : b->kind == NVN_RB_SAMPT ? (reg < NTEX ? (int)(S.tex[1][reg] >> 20) : 0) : reg < 128 ? (int)(S.samp[1][reg] >> 20) : 0;
+        on = sid > 0 && samp_fast(sid) && sid < g_nsreg && g_sview_w[sid];
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    return on ? 2 : 0;
+}
 static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
     memset(k, 0, sizeof *k);
     k->vs = (__bridge void *)vs; k->fs = (__bridge void *)fs;
     memcpy(k->cfmt, cfmt, sizeof k->cfmt); k->dfmt = dfmt; k->sfmt = sfmt; k->samples = samples;
     k->blend_en = S.color.blend_en; k->chmask = S.chmask.mask; k->a2c = S.ms.a2c; k->atest = atest_key(fs, cfmt, lmap ? g_pso_lmap : NULL);
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
-    k->logic = lop_key(k, fs, lmap);
+    k->logic = lop_key(k, fs, lmap) | border_key(fs);
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 16 && a < S.nattr) { k->attr[a] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
     pso_key_norm(k, lmap);
@@ -7876,27 +8007,33 @@ static void sd_finish(void) {
 // Coverage proof (holds only if all are satisfied; anything unrecognized is treated as not holding):
 //   Shader: the vertex position xyz is taken as-is from one vertex attribute, w is 1 or the same attribute's .w (dmsh_build raster_facts); the fragment does not discard, does not write sample_mask, and writes this color index
 //   State: this attachment has no blending, a full write mask, no alpha-to-coverage, fill mode, no depth test (or ALWAYS), no stencil test, single sample, not 3D
-//   Vertices: non-indexed or 16 / 32-bit indexed draws, with indices and positions both read from CPU-visible pool memory; the scissor / viewport / geometry / winding / depth clipping decisions are in nvn_cover.h (pure functions, with unit tests)
-// Read out attribute a of all vertices of this draw (non-indexed or 16 / 32-bit indexed; vertex number = first + k or index value + base_vertex), with missing components filled with 0 / 1 per the fetch rules.
+//   Vertices: non-indexed or 8 / 16 / 32-bit indexed draws, with indices and positions both read from CPU-visible pool memory; the scissor / viewport / geometry / winding / depth clipping decisions are in nvn_cover.h (pure functions, with unit tests)
+// Read float2/3/4 or half2/3/4 attribute a of all vertices (non-indexed or 8 / 16 / 32-bit indexed; vertex number = first + k or index value + base_vertex), with missing components filled with 0 / 1 per the fetch rules.
 // Returns 0 on success, a reason code on failure (6 vertex count / index type, 7 attribute index, 8 format / stream, 9 out of bounds, 10 address)
 static int attr_read(int a, const p_draw *dw, const p_draw_idx *di, float P[64][4]) {
     int n = dw ? dw->count : di->count;
-    if (n < 1 || n > 64 || (dw && dw->first < 0) || (di && (di->itype < 1 || di->itype > 2))) return 6;
+    if (n < 1 || n > 64 || (dw && dw->first < 0) || (di && (di->itype < 0 || di->itype > 2))) return 6;
     if (a < 0 || a >= S.nattr || S.attr[a].stream >= 16) return 7;
     va_st at = S.attr[a]; vs_st sm = S.stream[at.stream]; NVNbufferRange vb = S.vbuf[at.stream];
-    MTLVertexFormat vf = vfmt(at.fmt); int nc = vf == MTLVertexFormatFloat2 ? 2 : vf == MTLVertexFormatFloat3 ? 3 : vf == MTLVertexFormatFloat4 ? 4 : 0;
+    MTLVertexFormat vf = vfmt(at.fmt);
+    int hf = vf == MTLVertexFormatHalf2 || vf == MTLVertexFormatHalf3 || vf == MTLVertexFormatHalf4;
+    int nc = vf == MTLVertexFormatFloat2 || vf == MTLVertexFormatHalf2 ? 2 : vf == MTLVertexFormatFloat3 || vf == MTLVertexFormatHalf3 ? 3 : vf == MTLVertexFormatFloat4 || vf == MTLVertexFormatHalf4 ? 4 : 0;
+    int bytes = (hf ? 2 : 4) * nc;
     if (!nc || !sm.stride || sm.divisor || !vb.address) return 8;
-    const uint8_t *ib = NULL; int isz = di ? (di->itype == 1 ? 2 : 4) : 0;
+    const uint8_t *ib = NULL; int isz = di ? 1 << di->itype : 0;
     if (di && pend_hits(di->ibuf, (uint64_t)n * isz)) return 10;   // indices written by a copy / update earlier in this submission: the CPU still sees the old ones
     if (di) { void *m; uint64_t o; if (!mtl_addr(di->ibuf, (uint64_t)n * isz, &m, &o) || !(ib = [(__bridge id<MTLBuffer>)m contents])) return 10; ib += o; }
     for (int k = 0; k < n; k++) {
-        int64_t vid = dw ? (int64_t)dw->first + k : (isz == 2 ? (int64_t)((const uint16_t *)ib)[k] : (int64_t)((const uint32_t *)ib)[k]) + di->base_vertex;
+        int64_t vid = dw ? (int64_t)dw->first + k : (isz == 1 ? (int64_t)ib[k] : isz == 2 ? (int64_t)((const uint16_t *)ib)[k] : (int64_t)((const uint32_t *)ib)[k]) + di->base_vertex;
         uint64_t off = (uint64_t)vid * sm.stride + at.offset;
-        if (vid < 0 || off + 4 * nc > vb.size) return 9;
-        if (pend_hits(vb.address + off, 4 * nc)) return 10;   // position written on the GPU earlier in this submission
+        if (vid < 0 || off + bytes > vb.size) return 9;
+        if (pend_hits(vb.address + off, bytes)) return 10;   // position written on the GPU earlier in this submission
         void *mb; uint64_t mo; const uint8_t *base;
-        if (!mtl_addr(vb.address + off, 4 * nc, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 10;
-        float v[4] = {0, 0, 0, 1}; memcpy(v, base + mo, 4 * nc); memcpy(P[k], v, sizeof v);
+        if (!mtl_addr(vb.address + off, bytes, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 10;
+        float v[4] = {0, 0, 0, 1};
+        if (hf) for (int c = 0; c < nc; c++) { _Float16 h; memcpy(&h, base + mo + 2 * c, 2); v[c] = (float)h; }
+        else memcpy(v, base + mo, bytes);
+        memcpy(P[k], v, sizeof v);
     }
     return 0;
 }
@@ -10101,8 +10238,185 @@ static void draw_multi(const p_multi_draw *m) {
     g_mdx_range = NULL;
     g_mdxc.next = NULL;
 }
+// ---------- Window copy: the gates (see the note at g_wc) ----------
+static MTLViewport present_viewport(double cw, double ch, double dw, double dh);
+// DM_NVN_WINDOW_COPY=[verify:]<fragment key>[:<vertex key>][,...] (key prefixes, up to 8 entries). The fragment shader is the claim no reflection can make for us: its output is its one texture sample and nothing else (no gamma, no
+// pixel position). An entry without a vertex key accepts any vertex shader whose position is an attribute as it is (the generic coverage proof); one with a vertex key also accepts that vertex shader when its position
+// is the affine form wc_affine_cover evaluates. wc_mode(NULL, ...) tells whether the feature is on at all
+static int wc_mode(const char *fskey, const char *vskey, int *affine, int *verify) {
+    static int n = -1, ver; static char keys[8][2][24];
+    if (n < 0) { n = 0; const char *e = getenv("DM_NVN_WINDOW_COPY");
+        if (e && !strncmp(e, "verify:", 7)) { ver = 1; e += 7; }
+        for (; e && *e && n < 8; e = strchr(e, ',') ? strchr(e, ',') + 1 : e + strlen(e)) {
+            size_t l = strcspn(e, ",:"), m = e[l] == ':' ? strcspn(e + l + 1, ",") : 0; if (l > 23) l = 23; if (m > 23) m = 23; if (!l) continue;
+            memcpy(keys[n][0], e, l); keys[n][0][l] = 0; if (m) memcpy(keys[n][1], e + strcspn(e, ":") + 1, m); keys[n][1][m] = 0; n++; }
+        if (n) MLOG("DM_NVN_WINDOW_COPY: %d allowlisted fragment key%s%s", n, n > 1 ? "s" : "", ver ? ", verify only (every gate is evaluated and logged, nothing is redirected)" : ""); }
+    if (verify) *verify = ver;
+    if (!fskey) return n > 0;
+    for (int i = 0; i < n; i++) if (!strncmp(fskey, keys[i][0], strlen(keys[i][0]))) {
+        if (!keys[i][1][0]) { if (affine) *affine = 0; return 1; }
+        if (vskey && !strncmp(vskey, keys[i][1], strlen(keys[i][1]))) { if (affine) *affine = 1; return 1; } }
+    return 0;
+}
+// Each distinct reason is logged once with the frame it first happened in; later ones are counted and logged again at powers of two from 64 (a pass-by-pass log would be thousands of lines)
+static void wc_note(const char *why) {
+    static char *seen[24]; static uint64_t cnt[24]; static int n;
+    for (int i = 0; i < n; i++) if (!strcmp(seen[i], why)) { if (++cnt[i] >= 64 && !(cnt[i] & (cnt[i] - 1))) MLOG("window copy: %s: %llu times (%llu redirected)", why, (unsigned long long)cnt[i], (unsigned long long)g_wc_redirected); return; }
+    if (n < 24) { seen[n] = strdup(why); cnt[n++] = 1; }
+    MLOG("window copy: %s (frame %llu, pass %llu; %llu redirected so far)", why, (unsigned long long)atomic_load(&g_cur_frame), (unsigned long long)g_stat_pass + 1, (unsigned long long)g_wc_redirected);
+}
+static const char *g_wc_why;
+// The rest of the pass the draw opens, like ds_scan (replay order to the next pass boundary): nothing may add a draw or a clear to it, set the window texture as a target again (the same-target
+// continuation would append to the pass) or copy to / from it. DS_USED = refused (g_wc_why), DS_FREE = the pass ends there, DS_RET = the list ends first (the caller goes on in the caller's list).
+// Draws and binds after the pass are other passes: whether one of those could read the window texture is decided by wc_try (no descriptor refers to it) and wc_touch_ (later ones)
+static int wc_scan(const uint8_t *p, uint64_t wser, int depth) {
+    for (int guard = 0; guard < 1000000; guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        const void *a = p + 8;
+        if (g_hoist_n && hoist_skipped(p)) { p += h.size; continue; }
+        switch (h.op) {
+            case OP_END: return DS_RET;
+            case OP_JUMP: { const uint8_t *t; memcpy(&t, a, 8); p = t; continue; }
+            case OP_CALL: { uint64_t t; memcpy(&t, a, 8); if (depth >= 8) { g_wc_why = "sub-list nesting too deep to look ahead"; return DS_USED; }
+                int r = wc_scan((const uint8_t *)t, wser, depth + 1); if (r != DS_RET) return r; break; }
+            case OP_SET_RT: { const p_set_rt *r = a;
+                for (int k = 0; k < r->n && k < 8; k++) if (r->color[k] && r->color[k]->serial == wser) { g_wc_why = "the window texture is set as a target again after the draw"; return DS_USED; }
+                return DS_FREE; }
+            case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: case OP_DRAW_TEX: g_wc_why = "another draw in the pass"; return DS_USED;
+            case OP_CLEAR_COLOR: case OP_CLEAR_DS: g_wc_why = "a clear in the pass after the draw"; return DS_USED;
+            case OP_COPY_T2T: { const p_copy_t2t *c = a; if ((c->src && c->src->serial == wser) || (c->dst && c->dst->serial == wser)) { g_wc_why = "the window texture is copied from or to after the draw"; return DS_USED; } return DS_FREE; }
+            case OP_COPY_B2T: case OP_COPY_T2B: { const p_copy_b2t *c = a; if (c->tex && c->tex->serial == wser) { g_wc_why = "the window texture is copied from or to after the draw"; return DS_USED; } return DS_FREE; }
+            case OP_CLEAR_TEX: { const p_clear_tex *c = a; if (c->tex && c->tex->serial == wser) { g_wc_why = "the window texture is cleared after the draw"; return DS_USED; } return DS_FREE; }
+            case OP_DLSS: { const p_dlss *c = a; for (int k = 0; k < DLSS_TEXTURES; k++) if (c->tex[k] && c->tex[k]->serial == wser) { g_wc_why = "the window texture is a DLSS input or output"; return DS_USED; } return DS_FREE; }
+            case OP_COPY_B2B: case OP_CLEAR_BUF: case OP_UPDATE_UB: case OP_DISPATCH: return DS_FREE;
+            default: break;
+        }
+        p += h.size;
+    }
+    g_wc_why = "look-ahead did not end"; return DS_USED;
+}
+// The coverage proof for a vertex shader with no position-as-is attribute (reflection pos_attr -1) that the allowlist names: clip = M * (x, y, z, 1) of its one float attribute, the rows of M in vectors 1..4 of the first
+// uniform buffer (vp_c3, DKB's a6430615519b0e2f_b unit quad; read as the draw sees them, ubo_float), z then mapped as the shader does (fma(z, 0.5, w * 0.5)). Evaluated on this draw's own vertices and uniforms, then
+// the geometric proof for two triangles (nvn_cover_quad). The formula is read from the shader's source, not from reflection: that is what the allowlist entry asserts. Returns NULL when the draw covers the window
+// texture, else the reason
+static const char *wc_affine_cover(NvShader *vs, const p_draw *dw, const p_draw_idx *di, NSUInteger W, NSUInteger H) {
+    if (vs->rf.pos_attr >= 0 || vs->rf.nv != 1 || vs->rf.v[0].loc != 0) return "the vertex shader does not have exactly one input";
+    int n = dw ? dw->count : di->count, prim = dw ? dw->prim : di->prim;
+    if (n != 6 || prim != NVN_COVER_TRIANGLES) return "not six vertices of triangles";
+    float m[4][4];
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) if (!ubo_float(0, (uint16_t)(((r + 1) << 2) | c), &m[r][c])) return "the matrix is not readable (written by the GPU in this submission, or not bound)";
+    float P[64][4], C[6][4];
+    int attr = vs->rf.v[0].nvn, why = attr_read(attr, dw, di, P);
+    if (why) {
+        static char reason[128];
+        int fmt = attr >= 0 && attr < S.nattr ? S.attr[attr].fmt : -1;
+        snprintf(reason, sizeof reason, "vertex read reason %d, attribute %d, format %d, index type %d", why, attr, fmt, di ? di->itype : -1);
+        return reason;
+    }
+    for (int k = 0; k < 6; k++) {
+        float x = P[k][0], y = P[k][1], z = P[k][2], o[4];
+        for (int r = 0; r < 4; r++) o[r] = fmaf(z, m[r][2], fmaf(x, m[r][0], y * m[r][1])) + m[r][3];
+        C[k][0] = o[0]; C[k][1] = o[1]; C[k][2] = fmaf(o[2], 0.5f, o[3] * 0.5f); C[k][3] = o[3];
+    }
+    int sc[4] = {R.sc.x, R.sc.y, R.sc.w, R.sc.h}; float vp[4] = {S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3]};
+    int front_ccw = (S.poly.front == NVN_FRONT_FACE_CCW) ^ g_queue_origin_ll ^ atomic_load_explicit(&g_origin_ll, memory_order_relaxed);
+    if (S.color.blend_en & 1 || (S.chmask.mask & 0xf) != 0xf || S.ms.a2c || S.poly.mode != NVN_POLYGON_MODE_FILL || atest_on() || lop_on() || S.depth_clamp) return "blending, a partial write mask, alpha-to-coverage, a fill mode, an alpha test or logic operation, or depth clamp";
+    return nvn_cover_quad((const float (*)[4])C, 6, (int)S.poly.cull, front_ccw, S.has_vp, vp, R.has_sc, sc, (long)W, (long)H) ? NULL : "the geometry does not hold every pixel of the window texture";
+}
+// The decision for the draw that opens a pass, before the pass opens: returns the window's table entry (and sets the target for attach) when this draw can go to the host target. Every condition is checked here,
+// each with its reason; verify mode stops short of the last step. Nothing here is cached across draws: the state it reads is the replay's state at this draw
+#define WC_NO(msg) do { wc_note(msg); return NULL; } while (0)
+static wc_ent *wc_try(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    if (atomic_load(&g_wc_off) || !wc_mode(NULL, NULL, NULL, NULL)) return NULL;
+    if (!R.has_rt || R.rt.n < 1 || !R.rt.color[0]) return NULL;
+    const tex_t *W = R.rt.color[0];
+    if (!xv_present(W->serial)) return NULL;   // not a window texture the game has presented
+    NvShader *vs = pr->sh[0], *fs = pr->sh[1]; int verify = 0, affine = 0;
+    if (!fs || !vs || !wc_mode(fs->key, vs->key, &affine, &verify)) return NULL;   // another pass on the window (a menu, a movie, a loading screen): drawn as always, and not worth a log line
+    if (mtl_snap_on()) WC_NO("refused: present snapshots are on");
+    if (g_geo_program || g_geo_mesh.on || g_defer_replaying || g_fz.active || g_fz_checking) WC_NO("refused: the draw is replayed or merged by another path");
+    for (int k = 1; k < R.rt.n && k < 8; k++) if (R.rt.color[k]) WC_NO("refused: more than one colour target");
+    if (R.rt.depth) WC_NO("refused: a depth-stencil target is attached");
+    if (W->d.target != NVN_TEXTURE_TARGET_2D || W->d.levels > 1 || W->d.depth > 1 || W->d.samples > 1) WC_NO("refused: the window texture is not a single 2D level of one sample");
+    if (R.rt.has_cview[0] && ((R.rt.cview[0].set_levels && R.rt.cview[0].base_level) || (R.rt.cview[0].set_layers && (R.rt.cview[0].min_layer || R.rt.cview[0].nlayers > 1)))) WC_NO("refused: the target view is not level 0 layer 0");
+    if (pr->sh[2] || pr->sh[3] || pr->sh[4]) WC_NO("refused: the program has a geometry or tessellation stage");
+    if (fs->rf.fc_fpos || fs->rf.reads_prim_id || fs->rf.may_discard || fs->rf.writes_smask || fs->rf.bindless || fs->rf.dyn || !fs->rf.color_known || fs->rf.color_mask != 1 || (vs->rf.pos_attr < 0 && !affine)) WC_NO("refused: the shaders' reflection does not show a plain textured draw of colour 0 with a position the proof can follow");
+    if ((dw && (dw->ind || dw->mdi_cnt || dw->instances > 1)) || (di && (di->ind || di->mdi_cnt || di->instances > 1))) WC_NO("refused: indirect, multi-draw or instanced draw");
+    if (S.rast_discard || S.tf_on || S.vp_sw[0][0] || S.vp_sw[0][1] || S.vp_sw[0][2] || S.vp_sw[0][3]) WC_NO("refused: rasterizer discard, transform feedback or a viewport swizzle");
+    if (!g_exec_next || g_ret_n > 16) WC_NO("refused: no look-ahead from this draw");
+    id<MTLTexture> Wt = tex_mtl(W);
+    if (!Wt || Wt.sampleCount != 1 || Wt.textureType != MTLTextureType2D || Wt.mipmapLevelCount != 1 || Wt.arrayLength != 1) WC_NO("refused: the window texture's host texture is not a single 2D level");
+    if (tex_from_storage(W) || tex_storage_dst(W)) WC_NO("refused: the window texture is backed by CPU-visible storage");
+    // Exactly one texture read, a single level (the sample's level of detail cannot depend on the target size), not the window itself, and no storage image or buffer texture
+    int ntex = 0; uint64_t th = 0;
+    for (int i = 0; i < fs->rf.nb; i++) { const nvn_rbind *b = &fs->rf.b[i];
+        if (b->kind == NVN_RB_IMG || b->kind == NVN_RB_TBUF || b->kind == NVN_RB_TEXU || b->kind == NVN_RB_TEXD || b->kind == NVN_RB_TEXA) WC_NO("refused: the fragment shader reads an image, buffer texture or bindless texture");
+        if (b->kind == NVN_RB_TEX) { ntex++; th = fs->stage < 6 ? tex_slot_h(S.tex[fs->stage], S.img[fs->stage], b->reg) : 0; } }
+    if (ntex != 1 || !th) WC_NO("refused: the fragment shader does not read exactly one bound texture");
+    {   tex_t st = {0}; int tid = (int)(th & 0xfffff);
+        os_unfair_lock_lock(&g_rmu); if (tid > 0 && tid < g_ntreg && g_treg[tid].ok) st = g_treg[tid].t; os_unfair_lock_unlock(&g_rmu);
+        if (!st.serial || st.serial == W->serial || st.d.target != NVN_TEXTURE_TARGET_2D || st.d.levels > 1 || st.d.samples > 1) WC_NO("refused: the sampled texture is missing, the window itself, or not a single 2D level of one sample"); }
+    if (draw_samples_rt(pr)) WC_NO("refused: the draw may sample an attachment");
+    if (!scissor_full(W, &R.rt.cview[0], R.rt.has_cview[0])) WC_NO("refused: the scissor does not cover the window texture");
+    if (vs->rf.pos_attr >= 0) { if (!first_draw_covers(0, Wt, 0)) { static char b[96]; snprintf(b, sizeof b, "refused: the draw is not proven to cover the whole window texture (reason %d)", g_fd_why); WC_NO(b); } }
+    else { const char *why = wc_affine_cover(vs, dw, di, Wt.width, Wt.height); if (why) { static char b[160]; snprintf(b, sizeof b, "refused: the draw is not proven to cover the whole window texture (%s)", why); WC_NO(b); } }
+    {   int reg; os_unfair_lock_lock(&g_rmu); reg = nvn_hm_get(&g_treg_serial, (void *)&W->serial) != NULL; os_unfair_lock_unlock(&g_rmu);
+        if (reg) WC_NO("refused: the window texture is registered in a descriptor pool, so a draw could sample it"); }
+    g_wc_why = NULL;
+    int r = wc_scan(g_exec_next, W->serial, 0);
+    for (int k = g_ret_n - 1; r == DS_RET && k >= 0; k--) r = wc_scan(g_ret[k], W->serial, 0);
+    for (int k = 0; r == DS_RET && k < g_nrest; k++) r = wc_scan((const uint8_t *)g_rest[k], W->serial, 0);
+    if (r == DS_USED) { static char b[128]; snprintf(b, sizeof b, "refused: %s", g_wc_why ? g_wc_why : "the pass is not just this draw"); WC_NO(b); }
+    // The size the present would scale the window texture to: the drawable (CAMetalLayer drawableSize), letterboxed. At or above the window texture's size there is nothing to save
+    CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
+    if (!layer) WC_NO("refused: no layer");
+    CGSize ds = layer.drawableSize;
+    if (ds.width < 1 || ds.height < 1) WC_NO("refused: the layer has no drawable size");
+    MTLViewport vp = present_viewport((double)Wt.width, (double)Wt.height, ds.width, ds.height);
+    NSUInteger pw = (NSUInteger)vp.width, ph = (NSUInteger)vp.height;
+    if (pw < 1 || ph < 1 || pw > Wt.width || ph > Wt.height || (pw == Wt.width && ph == Wt.height)) WC_NO("refused: the drawable is not smaller than the window texture");
+    if (verify) { wc_note("verify: every gate holds, the draw would go to the host target"); return NULL; }
+    // Replaced targets retire only after every queued/display GPU reader releases them.
+    wc_ent *e = NULL; uint64_t pser = 0, dead = 0;
+    pthread_mutex_lock(&g_wc_mu);
+    for (int i = 0; i < 8 && !e; i++) if (g_wc[i].wser == W->serial) e = &g_wc[i];
+    for (int i = 0; i < 8 && !e; i++) if (!g_wc[i].wser) e = &g_wc[i];
+    if (e && e->wser == W->serial && e->pw == pw && e->ph == ph && e->ww == Wt.width && e->wh == Wt.height) pser = e->pser;
+    pthread_mutex_unlock(&g_wc_mu);
+    if (!e) WC_NO("refused: more than eight window textures");
+    id<MTLTexture> P = pser ? (id<MTLTexture>)tex_get(pser) : nil;
+    if (!P || P.pixelFormat != Wt.pixelFormat) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:Wt.pixelFormat width:pw height:ph mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate; d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;   // the game's render target view may change the format (sRGB), as for the window texture
+        P = [g_dev newTextureWithDescriptor:d];
+        if (!P) WC_NO("refused: the host target could not be created");
+        P.label = @"window copy target";
+        res_add(P); res_commit();
+        static _Atomic uint64_t n; pser = (1ull << 60) + atomic_fetch_add(&n, 1) + 1; serial_put(pser, P);
+        pthread_mutex_lock(&g_wc_mu);
+        dead = e->wser == W->serial ? wc_retire(e->pser) : 0;
+        wc_owner *owner = calloc(1, sizeof *owner); if (!owner) MDIE("cannot allocate window copy ownership");
+        owner->serial = pser; owner->next = g_wc_owners; g_wc_owners = owner;
+        if (!e->wser) atomic_fetch_add(&g_wc_n, 1);
+        *e = (wc_ent){W->serial, pser, 0, Wt.width, Wt.height, pw, ph};
+        pthread_mutex_unlock(&g_wc_mu);
+        if (dead) serial_del(dead);
+        MLOG("window copy: window texture %llu %lux%lu format %lu → host target %lux%lu (the drawable is %.0fx%.0f), serial %llu", (unsigned long long)W->serial, (unsigned long)Wt.width, (unsigned long)Wt.height,
+             (unsigned long)Wt.pixelFormat, (unsigned long)pw, (unsigned long)ph, ds.width, ds.height, (unsigned long long)pser);
+    }
+    g_wc_base = P; g_wc_wser = W->serial;
+    return e;
+}
 static void draw_(const p_draw *dw, const p_draw_idx *di);
-static void draw(const p_draw *dw, const p_draw_idx *di) { cp_stamp start = cp_begin(); draw_(dw, di); cp_end(5, start); }
+// After a draw: if it was drawn into the redirected pass's host target, this frame's picture is in it and the present shows it (pending). Not before: a draw that returned early (no pipeline yet, an empty scissor)
+// leaves the target undefined, and the window texture is then presented as always
+static void wc_drawn(uint64_t draws_before) {
+    if (!g_wc_cur || g_stat_draw == draws_before) return;
+    if (g_wc_ndraw++) { wc_poison("a second draw reached the redirected pass", g_wc_cur->wser); return; }
+    pthread_mutex_lock(&g_wc_mu); g_wc_cur->pending = g_wc_cur->pser; pthread_mutex_unlock(&g_wc_mu);
+    if (!g_wc_redirected++) MLOG("window copy: the first window pass went to a %lux%lu host target instead of the %lux%lu window texture (pass %llu)", (unsigned long)g_wc_cur->pw, (unsigned long)g_wc_cur->ph, (unsigned long)g_wc_cur->ww, (unsigned long)g_wc_cur->wh, (unsigned long long)g_stat_pass);
+}
+static void draw(const p_draw *dw, const p_draw_idx *di) { cp_stamp start = cp_begin(); uint64_t d0 = g_stat_draw; draw_(dw, di); wc_drawn(d0); cp_end(5, start); }
 static void draw_(const p_draw *dw, const p_draw_idx *di) {
     g_draw_binst = (uint32_t)(dw ? dw->base_instance : di ? di->base_instance : 0);   // c0 + 0x644 of the stages that read the driver segment (encode_args)
     if (passdump()) { NvProg *p = g_geo_program ? g_geo_program : S.prog ? prog_get(S.prog) : nil;
@@ -10218,7 +10532,13 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (g_enc && g_sm_pass && draw_samples_rt(pr)) { PD("M %llu a draw in the slice-merged pass samples its attachment; split here", g_stat_pass); rp_end(); }
     if (!g_enc && mode == 0 && !g_rp_layered && !defer_q_draw && g_exec_next && !tbdr_on() && !g_geo_program && sm_on()) sm_plan(pr);
     vbuf_prepare(pr->sh[0] ? &pr->sh[0]->rf : NULL, dw, di);   // an unaligned GPU-written stream, or one the draw reads past, needs its ordered copy before the render encoder
+    // Check before wc_try can replace a resized host target and reset its pending picture.
+    for (int i = 0; !g_enc && atomic_load_explicit(&g_wc_n, memory_order_relaxed) && i < R.rt.n && i < 8; i++)
+        wc_touch(R.rt.color[i], "used by a later draw before present", 0);
+    wc_ent *wce = !g_enc && !defer_q_draw ? wc_try(pr, dw, di) : NULL;   // g_wc_base is set when the pass about to open is for the window's host target (attach)
     id<MTLRenderCommandEncoder> en = rp_begin_ex(mode);
+    g_wc_base = nil;
+    if (wce && en) { g_wc_cur = wce; g_wc_ndraw = 0; g_wc_sx = (double)wce->pw / wce->ww; g_wc_sy = (double)wce->ph / wce->wh; }
     g_rp_layered = 0; g_sm_plan.on = 0;
     g_fd_dw = NULL; g_fd_di = NULL;
     if (!en) { PD("Z %llu draw skipped: the render pass did not begin vs=%.16s fs=%.16s", g_stat_pass, pr && pr->sh[0] ? pr->sh[0]->key : "-", pr && pr->sh[1] ? pr->sh[1]->key : "-"); return; }   // Z lines: why a draw was dropped at these early returns
@@ -10233,14 +10553,16 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (skip_d) { g_stat_ds_omit++; if (mode == 3) g_stat_s_only++; else if (mode == 4) g_stat_d_only++; }
     // The pipeline depends only on (program, render pass targets, blend / color / write mask / multisample state, vertex layout): if these did not change, reuse the previous one
     static id<MTLRenderPipelineState> cur_ps; static NvProg *cur_pr; static uint64_t cur_ps_pass; static int cur_pull;   // cur_pull: a hybrid (pulling) pipeline, asked for again at the next draw
+    // The border correcting library (border_key) follows the samplers bound at this draw, and binding a sampler does not mark the pipeline dirty
+    static uint32_t cur_bkey; uint32_t bkey = g_geo_mesh.on || S.rast_discard ? 0 : border_key(pr->sh[1]);
     if (g_fz.active && !g_defer_replaying) { g_pso_lmap = g_fz.phase == 1 ? g_fz.lmap1 : g_fz.lmap2; g_pso_fsfn = g_fz.phase == 1 ? nil : fz_fn; g_pso_fz = g_fz.phase == 1 ? (pso_fz_desc){0} : g_fz_desc; g_pso_dirty = 1; }   // Readable tile merge: fetch the pipeline by the physical -> logical mapping and the specialization
     else if (g_fb_tseq == g_draw_seq && g_fb_tfn && !g_defer_replaying) { g_pso_lmap = g_fb_tlmap; g_pso_fsfn = g_fb_tfn; g_pso_fz = g_fb_tdesc; g_pso_dirty = 1; }   // same-pass feedback read from the tile (fb_tile_plan)
     if (g_geo_mesh.on) { cur_ps = geo_mesh_pso(pr); cur_pull = 1; cur_pr = nil; if (!cur_ps) { g_geo_mesh.miss = 1; return; } }   // a mesh draw (geo_mesh_draw): pulls its streams; the next draw fetches its own pipeline; none yet: the compute path draws
-    else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
+    else if (g_pso_dirty || pr != cur_pr || cur_ps_pass != g_pass.serial || bkey != cur_bkey) { g_pso_amp = g_sm_pass; cur_ps = pso_get(pr, nil); g_pso_amp = 0; cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_bkey = bkey; g_pso_dirty = !cur_ps || cur_pull; }
     if (!cur_ps && g_sm_pass) {   // a draw whose amplified pipeline is not built yet (sm_amp_get queued it): the slice-merged pass ends and the draw opens a pass of its own
         g_sm_nwait++; PD("M %llu slice-merged pass: no amplified pipeline yet for vertex %s fragment %s; split here", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
         rp_end(); en = rp_begin_ex(mode); if (!en) return;
-        cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
+        cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; cur_bkey = bkey; g_pso_dirty = !cur_ps || cur_pull; }
     uint32_t raster_mask = draw_color_writes(pr);   // Capture the physical mapping before resetting the merged pipeline state.
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
     __unsafe_unretained id<MTLRenderPipelineState> ps = cur_ps;
@@ -10262,6 +10584,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // Viewport / scissor (clamped within the target size)
     NSUInteger tw = g_pass.tw, th = g_pass.th;
     { MTLViewport v = S.has_vp ? (MTLViewport){S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.dr[0], S.dr[1]} : (MTLViewport){0, 0, tw, th, 0, 1};
+      if (g_wc_cur && S.has_vp) { v.originX *= g_wc_sx; v.originY *= g_wc_sy; v.width *= g_wc_sx; v.height *= g_wc_sy; }   // the game's viewport is in window texture pixels: the same part of the host target
       if (atomic_load_explicit(&g_origin_ll, memory_order_relaxed)) { v.originY += v.height; v.height = -v.height; }   // lower-left origin (see g_origin_ll)
       // Viewport swizzle: NEGATIVE_Y negates clip y, the same as the viewport flipped about its centre; facing is decided after it on the GPU as in Metal, so the winding stays.
       // Other swizzles (axis exchanges, negated x / z / w) are no viewport change and are drawn unswizzled
@@ -10620,6 +10943,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     rp_flush();   // Materialize pending clears before reading, matching copy_t2t.
     g_wr_epoch++; g_mdx_epoch++;
     if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "texture-to-buffer copy");
+    wc_touch(c->tex, "copied out to a buffer", 1);
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
@@ -10644,6 +10968,7 @@ static void copy_t2b(const p_copy_b2t *c) {
 // CPU texture read (ReadTexels): for packaged textures the pool memory is the ground truth, de-layout and read directly; the rest are read back from the MTLTexture by blit (the caller has already waited for the GPU per NVN rules)
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     xv_check(t->serial, level, layer0, "CPU readback");
+    wc_touch(t, "read back by the CPU", 1);
     PD("U cpu_read ser=%llu lv%u sl%u xyz=%d,%d,%d size=%d,%d,%d dst=%p row=%lu img=%lu", t->serial, level, layer0, r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth, dst, (unsigned long)row, (unsigned long)img);
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (r->height + bh - 1) / bh, x0 = (size_t)(r->xoffset / bw) * bpb, y0 = r->yoffset / bh;
@@ -10786,6 +11111,7 @@ static void mirror_rb_land(void *p) {   // the submission's completion handler
     free(m);
 }
 static void copy_b2t(const p_copy_b2t *c) {
+    wc_touch(c->tex, "written by a buffer copy", 0);
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) { PD("C ser=%llu (no host texture)", c->tex->serial); return; }
@@ -10910,6 +11236,7 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
 static void draw_tex(const p_draw_tex *c) {
     static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *pso; static id<MTLFunction> vf, ff; static id<MTL4ArgumentTable> at; static int failed;
     if (failed || g_rc_skip || !R.has_rt) return;
+    if (R.rt.n) wc_touch(R.rt.color[0], "drawn into by a texture draw", 0);
     float dw = c->d.x1 - c->d.x0, dh = c->d.y1 - c->d.y0;
     if (dw == 0 || dh == 0) return;
     if (!pso) {
@@ -10970,6 +11297,7 @@ static void draw_tex(const p_draw_tex *c) {
 // GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
 static void copy_t2t(const p_copy_t2t *c) {
     if (c->src) xv_check(c->src->serial, c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, "texture copy source");
+    wc_touch(c->src, "copied from", 1); wc_touch(c->dst, "written by a texture copy", 0);
     rp_flush();   // Land the pending pure-clear render pass first (zero-source candidates only enter the set when the render pass ends); the blit() below would end the render pass anyway
     if (c->dst) zskip_del(c->dst->serial);
     if (c->src && c->dst && c->sr.xoffset == 0 && c->sr.yoffset == 0 && c->dr.xoffset == 0 && c->dr.yoffset == 0
@@ -11114,6 +11442,8 @@ static dlss_scaler *dlss_scaler_for(const p_dlss *c, id<MTLTexture> col, id<MTLT
 }
 static void dlss_eval(const p_dlss *c) {
     rp_flush();   // the passes before it land first: they write its inputs
+    for (int i = 0; i < DLSS_TEXTURES; i++)
+        wc_touch(c->tex[i], i == DLSS_OUTPUT ? "written by DLSS" : "read by DLSS", i != DLSS_OUTPUT);
     id<MTLTexture> col = c->tex[DLSS_COLOR] ? tex_mtl(c->tex[DLSS_COLOR]) : nil, dep = c->tex[DLSS_DEPTH] ? tex_mtl(c->tex[DLSS_DEPTH]) : nil, mot = c->tex[DLSS_MOTION] ? tex_mtl(c->tex[DLSS_MOTION]) : nil,
                    out = c->tex[DLSS_OUTPUT] ? tex_mtl(c->tex[DLSS_OUTPUT]) : nil;
     if (!col || !out) { static int once; if (!once++) MLOG("[RED] DLSS evaluated without %s", col ? "an output" : "an input colour"); return; }
@@ -11180,6 +11510,7 @@ static unsigned mtl_pf_chmask(MTLPixelFormat pf) {
 // View with changed format: clear on that view. Partial colour regions / channel masks use a triangle and preserve everything else.
 static void clear_tex_tri(id<MTLTexture> t, unsigned lv, unsigned l0, const p_clear_tex *c);
 static void clear_tex(const p_clear_tex *c) {
+    wc_touch(c->tex, "cleared as a texture", 0);
     if (c->tex) zskip_del(c->tex->serial);
     id<MTLTexture> t = tex_mtl(c->tex);
     PD("X ser=%llu view format %#x region %d,%d,%d %dx%dx%d mask %#x %s %g,%g,%g,%g", c->tex ? c->tex->serial : 0ull, c->has_view && c->view.set_format ? c->view.format : -1, c->r.xoffset, c->r.yoffset, c->r.zoffset, c->r.width, c->r.height, c->r.depth, c->mask,
@@ -11491,6 +11822,7 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
+                for (int k = 0; atomic_load_explicit(&g_wc_n, memory_order_relaxed) && k < r->n && k < 8; k++) wc_touch(r->color[k], "set as a render target again in its frame", 0);
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
@@ -11529,6 +11861,11 @@ void mtl_exec(const uint8_t *p) {
                 // A load-action clear covers the whole attachment and every stencil bit. A clear whose scissor does not cover the depth target, or whose stencil mask is partial, is drawn as a triangle
                 // (clear_ds_tri), in or before a pass: before the first draw and for a partial stencil mask in a pass it used to clear the whole target (PR #108)
                 unsigned sm = (unsigned)c->stencil_mask & 0xff;
+                // A partial stencil mask with no pass open and a depth clear over the whole target: only the stencil needs the triangle, and the depth half is the pass's load action, so
+                // the depth plane is not loaded only to be cleared (Donkey Kong Bananza: 22.8 MB of depth and stencil loaded a frame for a stencil mask of 1, 4.6 MB this way)
+                if (R.rt.depth && !g_enc && c->depth_mask && sm && sm != 0xff && scissor_full(R.rt.depth, &R.rt.dview, R.rt.has_dview)) {
+                    R.clear_d = 1; R.cd = c->depth; p_clear_ds s = *c; s.depth_mask = 0; clear_ds_tri(&s); break;
+                }
                 if (R.rt.depth && (!scissor_full(R.rt.depth, &R.rt.dview, R.rt.has_dview) || (sm && sm != 0xff))) { clear_ds_tri(c); break; }
                 // A full clear in the middle of a pass: end the pass and attach the clear to the start of the next one (color attachments load as usual, as a continued pass does above when a clear arrives).
                 // It used to be skipped, and later draws depth-tested against stale depth
@@ -12192,6 +12529,14 @@ static int up_mfx_encode(NvShader *cs) {
         args_dirty_all(); g_up_mfx_kept++; return 0;   // only the scratch image was scaled; the game's shader can still produce the output
     }
     args_dirty_all();
+    // A cached scaler can be reused after a dynamic-resolution change without a creation log.
+    // Record every size transition on successful dispatches, including returns to cached sizes.
+    static int last_size[4]; int size[4] = {ir.width, ir.height, orr.width, orr.height};
+    if (memcmp(size, last_size, sizeof size)) {
+        MLOG("upscaler: size at frame %llu, MetalFX dispatch %llu: %dx%d → %dx%d", (unsigned long long)atomic_load(&g_cur_frame),
+             (unsigned long long)(g_up_mfx_n + 1), size[0], size[1], size[2], size[3]);
+        memcpy(last_size, size, sizeof size);
+    }
     if (!g_up_mfx_n++) MLOG("upscaler: first dispatch of %s drawn by MetalFX, %dx%d at %d,%d of %lux%lu (format %lu) → %dx%d at %d,%d of %lux%lu (format %lu)%s", cs->key, ir.width, ir.height, ir.xoffset, ir.yoffset,
                             (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height,
                             (unsigned long)out.pixelFormat, direct ? ", straight" : ", through RGBA16F");
@@ -12258,6 +12603,50 @@ static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLT
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) { MLOG("[RED] offscreen present: the GPU did not finish within 10 s"); return 0; }
     return kind;
 }
+// Opt-in screenshot of the actual drawable, copied in its own present command buffer.
+// Unlike shot(), this neither drains the game queue nor renders a second diagnostic canvas.
+// Keep at most eight readbacks/PNG writes alive, including when a long frame list was requested.
+static atomic_int g_drawable_shot_pending;
+static void drawable_shot_encode(id<MTL4CommandBuffer> cb, MTL4CommitOptions *options, id<MTLTexture> tex, const char *path) {
+    MTLPixelFormat pf = tex.pixelFormat;
+    if (tex.framebufferOnly || (pf != MTLPixelFormatBGRA8Unorm && pf != MTLPixelFormatBGRA8Unorm_sRGB &&
+                              pf != MTLPixelFormatRGBA8Unorm && pf != MTLPixelFormatRGBA8Unorm_sRGB)) {
+        MLOG("[RED] drawable screenshot: unreadable format %lu", (unsigned long)pf); return;
+    }
+    if (atomic_fetch_add(&g_drawable_shot_pending, 1) >= 8) {
+        atomic_fetch_sub(&g_drawable_shot_pending, 1); MLOG("[RED] drawable screenshot backlog: dropping %s", path); return;
+    }
+    NSUInteger w = tex.width, h = tex.height, row = w * 4;
+    id<MTLBuffer> buf = [g_dev newBufferWithLength:row * h options:MTLResourceStorageModeShared];
+    id<MTL4ComputeCommandEncoder> en = buf ? [cb computeCommandEncoder] : nil;
+    if (!en) { atomic_fetch_sub(&g_drawable_shot_pending, 1); MLOG("[RED] drawable screenshot: allocation or encoder failed"); return; }
+    res_add(buf); res_commit();
+    [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()];
+    [en copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, 1)
+              toBuffer:buf destinationOffset:0 destinationBytesPerRow:row destinationBytesPerImage:row * h];
+    m4_end(en);
+    NSString *name = [NSString stringWithUTF8String:path]; uint64_t frame = g_present_n;
+    [options addFeedbackHandler:^(id<MTL4CommitFeedback> feedback) {
+        res_remove(buf);
+        if (feedback.error) { MLOG("[RED] drawable screenshot GPU failure: %s", feedback.error.description.UTF8String); atomic_fetch_sub(&g_drawable_shot_pending, 1); return; }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            @autoreleasepool {
+                int bgra = pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB;
+                CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+                CGBitmapInfo bi = bgra ? (kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little) : (CGBitmapInfo)kCGImageAlphaNoneSkipLast;
+                CGContextRef ctx = CGBitmapContextCreate(buf.contents, w, h, 8, row, cs, bi);
+                CGImageRef img = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
+                NSURL *url = [NSURL fileURLWithPath:name];
+                CGImageDestinationRef dst = img ? CGImageDestinationCreateWithURL((__bridge CFURLRef)url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
+                int ok = 0; if (dst) { CGImageDestinationAddImage(dst, img, NULL); ok = CGImageDestinationFinalize(dst); CFRelease(dst); }
+                CGImageRelease(img); CGContextRelease(ctx); CGColorSpaceRelease(cs);
+                MLOG("%sdrawable screenshot frame %llu %lux%lu format %lu → %s %s", ok ? "" : "[RED] ", (unsigned long long)frame,
+                     (unsigned long)w, (unsigned long)h, (unsigned long)pf, name.UTF8String, ok ? "ok" : "failed");
+                atomic_fetch_sub(&g_drawable_shot_pending, 1);
+            }
+        });
+    }];
+}
 // The present command buffer's GPU time (its commit feedback: from its first to its last command, the MetalFX scaler and the present pass), every 600 presents as p50 / p95, apart
 // for presents through MetalFX and through the bilinear pass. Under g_pq_mu (the feedback handler)
 static void present_gpu_note(double s, int fx) {
@@ -12270,7 +12659,7 @@ static void present_gpu_note(double s, int fx) {
     n[fx] = 0;
 }
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
-static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
+static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts, uint64_t wc_serial) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
@@ -12317,9 +12706,11 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
         nshot = 0; const char *e = getenv("DM_NVN_SHOT"), *c = e ? strchr(e, ':') : NULL;
         if (c) { shot_path = c + 1; for (const char *q = e; q < c && nshot < 4096; q = strchr(q, ',') ? strchr(q, ',') + 1 : c) shots[nshot++] = atol(q); }
     }
-    for (int i = 0; i < nshot; i++) if ((long)g_present_n == shots[i]) { char path[1024]; snprintf(path, sizeof path, shot_path, (int)g_present_n); mtl_finish_gpu(); shot(src, path, 1, crop); }
+    static int drawable_shots = -1;
+    if (drawable_shots < 0) { const char *v = getenv("DM_NVN_SHOT_DRAWABLE"); drawable_shots = v && !strcmp(v, "1"); }
+    if (!drawable_shots) for (int i = 0; i < nshot; i++) if ((long)g_present_n == shots[i]) { char path[1024]; snprintf(path, sizeof path, shot_path, (int)g_present_n); mtl_finish_gpu(); shot(src, path, 1, crop); }
     pthread_mutex_lock(&g_shotq_mu);
-    for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, crop); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
+    if (!drawable_shots) for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) { mtl_finish_gpu(); shot(src, g_shotq[i].path, 1, crop); g_shotq[i] = g_shotq[--g_nshotq]; } else i++;
     pthread_mutex_unlock(&g_shotq_mu);
 
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
@@ -12334,6 +12725,20 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     id<CAMetalDrawable> dr = supplied ? supplied : [layer nextDrawable];
     if (!supplied) g_drawable_ns += now_ns() - dt0;
     if (!dr) return 0;
+    // Report the actual display texture, not DM_NVN_SHOT_OUT's diagnostic canvas.
+    // Source/crop changes matter too: a game can keep its window size while changing its valid picture.
+    static NSUInteger display_sizes[4]; static int display_crop[4];
+    NSUInteger sizes[4] = {src.width, src.height, dr.texture.width, dr.texture.height};
+    NSUInteger display_rect[4];
+    if ((memcmp(display_sizes, sizes, sizeof sizes) || memcmp(display_crop, crop, sizeof display_crop)) && present_crop_rect(src, crop, display_rect)) {
+        memcpy(display_sizes, sizes, sizeof sizes); memcpy(display_crop, crop, sizeof display_crop);
+        MTLViewport vp = present_viewport(display_rect[2], display_rect[3], dr.texture.width, dr.texture.height);
+        MLOG("present dimensions: source %lux%lu, crop %d,%d %dx%d, drawable %lux%lu format %lu, layer %.3fx%.3f at scale %.3f, viewport %.0f,%.0f %.0fx%.0f, bounds %.6fx%.6f points, frame %.6f,%.6f %.6fx%.6f points",
+             (unsigned long)src.width, (unsigned long)src.height, crop[0], crop[1], crop[2], crop[3],
+             (unsigned long)dr.texture.width, (unsigned long)dr.texture.height, (unsigned long)dr.texture.pixelFormat,
+             layer.drawableSize.width, layer.drawableSize.height, layer.contentsScale, vp.originX, vp.originY, vp.width, vp.height,
+             layer.bounds.size.width, layer.bounds.size.height, layer.frame.origin.x, layer.frame.origin.y, layer.frame.size.width, layer.frame.size.height);
+    }
     int alloc_i = (int)(ticket % 3);
     if (g_present_alloc_fence[alloc_i]) {
         pthread_mutex_lock(&g_pq_mu);
@@ -12347,10 +12752,21 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     int kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
     if (!kind) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     int fx_kind = kind == PRESENT_METALFX;
-    [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
+    if (drawable_shots) {
+        for (int i = 0; i < nshot; i++) if ((long)g_present_n == shots[i]) {
+            char path[1024]; snprintf(path, sizeof path, shot_path, (int)g_present_n); drawable_shot_encode(cb, o, dr.texture, path);
+        }
+        pthread_mutex_lock(&g_shotq_mu);
+        for (int i = 0; i < g_nshotq;) if (g_present_n >= g_shotq[i].frame) {
+            drawable_shot_encode(cb, o, dr.texture, g_shotq[i].path); g_shotq[i] = g_shotq[--g_nshotq];
+        } else i++;
+        pthread_mutex_unlock(&g_shotq_mu);
+    }
+    [cb endCommandBuffer];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
         if (f.error) MLOG("[RED] display command buffer error: %s", f.error.description.UTF8String);
+        wc_release(wc_serial);
         pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; if (ticket > g_present_alloc_done[alloc_i]) g_present_alloc_done[alloc_i] = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv);
         present_gpu_note(f.GPUEndTime - f.GPUStartTime, fx_kind); pthread_mutex_unlock(&g_pq_mu);
     }];
@@ -12396,14 +12812,14 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
 // Swapchain texture return: before AcquireTexture gets a texture it waits for the ticket of that texture's previous present to be processed (mtl_present_wait), after which the commands the game draws into it
 // are necessarily ordered after that blit on the GPU queue.
 #define PQ 8
-typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v; } pq_item;   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
+typedef struct { tex_t t; double period; uint64_t frame; int crop[4]; double t_in; uint64_t ev_val, snap_v, wc_serial; } pq_item;   // snap_v: the snapshot copy this present shows (snap_commit_wait)   // t_in: the time the game handed this frame into the present queue (CACurrentMediaTime); ev_val: see g_ext_ev
 // External producer (the Vulkan layer, dm/gfx/vk) renders on its own queue and signals this event when a frame's rendering is done: the present of that frame waits for the value on g_q4
 static id<MTLSharedEvent> g_ext_ev;
 static void ext_wait(uint64_t v) { if (v && g_ext_ev) [g_q4 waitForEvent:g_ext_ev value:v]; }
 static void snap_commit_wait(uint64_t v);
 static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
-static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
+static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double, uint64_t);
 static double g_link_vperiod, g_link_vhalf;   // virtual ticks (link_range): seconds per counted tick (0 = every callback is a tick) and half a refresh of the screen
 
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
@@ -12454,6 +12870,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     // The previous frame's present interval was >= 2 (period > 25 ms): keep it on screen for its whole period before taking the next one, as the Switch flips only every N vertical syncs. This also holds while the link runs at 60 Hz (Mario 1.2.1 sets 2 for single frames, see nvn_game_fps in hle_nvn.c);
     //   before, every tick took the newest frame, so that frame, carrying the extra time step the game advanced for it, was shown for only 16.7 ms and the game looked like it jumped ahead
     if (g_link_hold_until > 0 && update.targetPresentationTimestamp < g_link_hold_until - tol) { g_link_held++; pthread_mutex_unlock(&g_pq_mu); return; }
+    uint64_t dropped_wc[PQ]; int ndropped_wc = 0;
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     // In order, one frame per tick and at most one behind the newest: two waiting, the older now and the newer on the next tick; three or more, the older ones are dropped. Taking the newest
     // dropped the one before whenever two frames landed in the same refresh, as frames of a 60 fps game that take 16-17.5 ms do, and the next frame then stayed up 33 ms
@@ -12462,16 +12879,18 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     if (fifo && ticket > first) ticket = ticket - first >= 2 ? g_pq_in - 1 : first;
     pq_item it = g_pq[(ticket - 1) % PQ]; g_link_it_tin = it.t_in;
     g_pq_read = ticket;
-    if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) g_pres[k % PRING] = (pres_ent){k, -1}; }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
+    if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) { dropped_wc[ndropped_wc++] = g_pq[(k - 1) % PQ].wc_serial; g_pres[k % PRING] = (pres_ent){k, -1}; } }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
     g_link_ring[ticket % PRING] = (link_ent){ticket, update.targetPresentationTimestamp, (update.targetPresentationTimestamp - cb) * 1e3, gap_max * 1e3, nticks}; nticks = 0; gap_max = 0;
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
+    for (int i = 0; i < ndropped_wc; i++) wc_release(dropped_wc[i]);
     int submitted;
     ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
-    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
+    @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp, it.wc_serial); }
     g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
     if (!submitted) {
+        wc_release(it.wc_serial);
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
         pthread_cond_broadcast(&g_pq_cv);
@@ -12567,10 +12986,11 @@ static void link_sync(void) {   // Called every frame by the game's present thre
 // waiting as-is for "the present queue to empty" would wait forever, the enter-background callback would not return, and the system would kill the process (the process disappears within 22 seconds after switching to another App).
 // These frames will not be seen anyway: discard them directly (accounted as dropped frames) and only wait for the one present already submitted to the GPU to finish.
 static void present_drop_for_suspend(void) {
+    uint64_t dropped_wc[PQ]; int ndropped_wc = 0;
     pthread_mutex_lock(&g_pq_mu);
     if (g_link_owns_layer) {
         uint64_t n = g_pq_in - g_pq_read;
-        for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) g_pres[k % PRING] = (pres_ent){k, -1};
+        for (uint64_t k = g_pq_read + 1; k <= g_pq_in; k++) { dropped_wc[ndropped_wc++] = g_pq[(k - 1) % PQ].wc_serial; g_pres[k % PRING] = (pres_ent){k, -1}; }
         g_link_dropped += n; g_pq_read = g_pq_in;
         while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         if (g_pq_done < g_pq_in) g_pq_done = g_pq_in;
@@ -12578,6 +12998,7 @@ static void present_drop_for_suspend(void) {
         if (n) MLOG("entering the background: dropping %llu queued frames not yet displayed (the display link does not fire in the background)", (unsigned long long)n);
     }
     pthread_mutex_unlock(&g_pq_mu);
+    for (int i = 0; i < ndropped_wc; i++) wc_release(dropped_wc[i]);
 }
 static void *present_main(void *arg) {
     (void)arg;
@@ -12592,9 +13013,10 @@ static void *present_main(void *arg) {
         pthread_mutex_unlock(&g_pq_mu);
         int submitted;
         ext_wait(it.ev_val); snap_commit_wait(it.snap_v);
-        @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0); }
+        @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, nil, 0, it.wc_serial); }
         pthread_mutex_lock(&g_pq_mu); g_classic_busy = 0; pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
         if (!submitted) {
+            wc_release(it.wc_serial);
             pthread_mutex_lock(&g_pq_mu);
             if (ticket > g_pq_done) g_pq_done = ticket;
             pthread_cond_broadcast(&g_pq_cv);
@@ -12735,7 +13157,8 @@ static uint64_t snap_take(const tex_t *t) {
 }
 static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4], uint64_t ev_val) {
     atomic_store(&dm_present_ns, now_ns());
-    if (g_classic || atomic_load(&g_present_discard)) return 0;   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait (g_classic: no Metal 4 queue to present on)
+    int wcrop[4]; uint64_t wcp = t && !ev_val && atomic_load_explicit(&g_wc_n, memory_order_relaxed) ? wc_take(t->serial, crop, wcrop) : 0;   // this frame's picture is in a host target (wc_try): present that; taken even when the present is dropped below
+    if (g_classic || atomic_load(&g_present_discard)) { wc_release(wcp); return 0; }   // Ticket number 0 = no pending present; the swapchain texture acquire does not wait (g_classic: no Metal 4 queue to present on)
     if (t) { xv_check(t->serial, 0, 0, "present"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial; }
     // A texture whose content comes from its storage is uploaded when it is first resolved (and again when its pages change), in an upload batch only the submit thread may open.
     // Bastion fills both window textures with WriteTexels at boot (main+0x9374) and presents one before drawing into it: resolved on the present thread, the upload aborted the host.
@@ -12755,9 +13178,11 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);
         if ((ss = snap_take(t))) { memset(&snap, 0, sizeof snap); snap.magic = MAGIC('T', 'E', 'X', 0); snap.serial = ss; t = &snap; }
     }
+    tex_t wct;
+    if (wcp) { memset(&wct, 0, sizeof wct); wct.magic = MAGIC('T', 'E', 'X', 0); wct.serial = wcp; t = &wct; crop = wcrop; }   // keeps the window texture's ticket: the game gets the texture back, and so P is free again, when this present is done
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_in - g_pq_done >= PQ) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // Wait only when the queue is full; normally AcquireTexture blocks first
-    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0};
+    pq_item *it = &g_pq[g_pq_in % PQ]; *it = (pq_item){*t, period, atomic_load(&g_cur_frame), {0}, CACurrentMediaTime(), ev_val, ss ? g_snap[slot].ev : 0, wcp};
     if (crop) memcpy(it->crop, crop, sizeof it->crop);   // The current frame's state is enqueued with the ticket number, rather than reading the mutable window late on the present thread
     uint64_t tk = ++g_pq_in;
     if (ss) { g_snap[slot].ticket = tk; atomic_fetch_add(&g_snap_next, 1); }
@@ -12779,8 +13204,12 @@ void mtl_present_wait(uint64_t tk) {
         if (g_pq_read >= tk) continue;
         if (now - last < STALL_NS) { pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts); continue; }   // The display link is still running, it is just not this one's turn yet: keep waiting (bounded, no busy spinning)
         uint64_t n = tk - g_pq_read;
-        for (uint64_t k = g_pq_read + 1; k <= tk; k++) g_pres[k % PRING] = (pres_ent){k, -1};
+        uint64_t dropped_wc[PQ]; int ndropped_wc = 0;
+        for (uint64_t k = g_pq_read + 1; k <= tk; k++) { dropped_wc[ndropped_wc++] = g_pq[(k - 1) % PQ].wc_serial; g_pres[k % PRING] = (pres_ent){k, -1}; }
         g_link_dropped += n; g_pq_read = tk;
+        pthread_mutex_unlock(&g_pq_mu);
+        for (int i = 0; i < ndropped_wc; i++) wc_release(dropped_wc[i]);
+        pthread_mutex_lock(&g_pq_mu);
         while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
         if (g_pq_done < tk) g_pq_done = tk;
         pthread_cond_broadcast(&g_pq_cv);
