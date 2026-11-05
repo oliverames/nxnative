@@ -11506,11 +11506,16 @@ static int ndve_direct_role(NvShader *cs) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *e = getenv("DM_NVN_NDVE_MOVIE_DIRECT");
-        enabled = e && !strcmp(e, "1");
+        enabled = e ? atoi(e) : 0;
     }
     if (!enabled) return 0;
     if (!strcmp(cs->key, "49dff010b9832251_b")) return 1;
     if (!strcmp(cs->key, "4f41ccf24f163e0d_b")) return 2;
+    if (enabled == 2) {   // =2: the reconstruction passes between them are not run at all (their output is replaced by the direct scale); a phone's GPU spends 42 ms a frame on them
+        static const char *const middle[] = {"ba079f68ae288dba_b", "a8b4fb48fee0ccf8_b", "e2eebd7ba18fe35f_b", "e6be82d835fbe4d3_b", "9442573ee4ace011_b",
+                                             "0a56002cdc7e1fce_b", "d15370a382630d4e_b", "7f7ff0f36b54d90f_b", "5a7d69b067a7f011_b"};
+        for (unsigned i = 0; i < sizeof middle / sizeof *middle; i++) if (!strcmp(cs->key, middle[i])) return 3;
+    }
     return 0;
 }
 static id<MTLTexture> ndve_image(NvShader *cs, unsigned slot, tex_t *desc) {
@@ -11550,6 +11555,11 @@ static void dispatch(const p_dispatch *dp) {
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
     int ndve = !dp->ind && dp->x && dp->y && dp->z == 1 ? ndve_direct_role(cs) : 0;
     if (ndve == 1) g_ndve_decoded = nil;
+    if (ndve == 3 && g_ndve_decoded) {
+        static int once;
+        if (!once++) MLOG("NDVE movie: skipping the reconstruction passes (DM_NVN_NDVE_MOVIE_DIRECT=2)");
+        return;
+    }
     if (ndve == 2 && g_ndve_decoded) {
         rp_flush();
         image_prepare(program, 0x20);
