@@ -1,13 +1,22 @@
 // A large memory pool in chunks (nvn_mtl.m BIG_MIN): a lookup gets a zero-copy buffer that holds what it asked and starts at its stride, so only what lookups reach is wired. The buffers must
 // say the same memory as the guest address, a read of unknown extent must have BIG_UNKNOWN past it, a chunk asked for more is lengthened, a texture's upload wires no chunk (up_big_src),
-// raw global memory's pool table covers the whole pool (big_full), the pool's removal takes every entry, and a smaller pool stays one buffer.
+// raw global memory's pool table covers the whole pool (big_full) but, for a pool that is the alias region, only as far as the game has mapped it (big_cover), the pool's removal
+// takes every entry, and a smaller pool stays one buffer.
 #include "../nvn/nvn_mtl.m"
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
+static uintptr_t g_alias_lo, g_alias_hi, g_alias_end;   // the stand-in for hle_svc.c's alias region: none until a test sets it
+uintptr_t svc_alias_reach(uintptr_t *lo, uintptr_t *hi) { *lo = g_alias_lo; *hi = g_alias_hi; return g_alias_end; }
 static int checks, failed;
+// Whether the pool table holds the address
+static int covered(id<MTLBuffer> map, uint64_t a) {
+    const uint64_t *r = map.contents;
+    for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) if (a >= r[4 * k] && a < r[4 * k + 1]) return 1;
+    return 0;
+}
 #define CHECK(label, c) do { checks++; if (!(c)) { failed++; fprintf(stderr, "FAIL: %s (line %d)\n", label, __LINE__); } } while (0)
 static void finish(void) { CHECK("submission completes", mtl_wait(mtl_sub_commit(), 5000000000ull)); CHECK("GPU has no submission error", !mtl_last_commit_error()); }
 // The lookup holds [a, a + n) in one buffer whose contents are the guest's memory there, and the GPU address agrees
@@ -101,5 +110,26 @@ int main(void) { @autoreleasepool {
     gml_read(log, old_map, -1, 0);
     CHECK("a completed bitmap resolves its entry in the original map", g_gml_n == 1 && g_gml_lo[0] == range[0] && g_gml_hi[0] == range[1]);
     mtl_pool_del(small); mtl_drain();
+    // A large pool that is the alias region: the table covers it only as far as the game ever mapped (rounded up to BIG_REACH_STEP), and grows with the mapping
+    uint8_t *al = mmap(NULL, GB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (al == MAP_FAILED) abort();
+    uint64_t ab = (uint64_t)(uintptr_t)al;
+    g_alias_lo = (uintptr_t)ab; g_alias_hi = (uintptr_t)(ab + GB); g_alias_end = (uintptr_t)(ab + 300 * MB);
+    mtl_pool_add(al, GB);
+    mtl_sub_begin(); id<MTLBuffer> m1 = gmem_map(); finish();
+    CHECK("alias pool: its entry stops at the mapped reach", g_big[0].full > 0 && g_pools[g_big[0].full - 1].end == ab + 320 * MB);
+    CHECK("alias pool: a mapped address is in the table", covered(m1, ab + 100 * MB) && covered(m1, ab + 319 * MB));
+    CHECK("alias pool: an address never mapped is not", !covered(m1, ab + 400 * MB) && !covered(m1, ab + GB - 1));
+    mtl_sub_begin(); CHECK("alias pool: the table is kept while the reach holds", gmem_map() == m1); finish();
+    id<MTLBuffer> past = look(ab + 900 * MB, 4096);   // a lookup past it still finds a chunk, not the pool
+    CHECK("alias pool: lookups past the reach take a chunk", past.length < GB);
+    CHECK("alias pool: lookups within the reach take its entry", look(ab + 100 * MB, 4096).length == 320 * MB);
+    g_alias_end = (uintptr_t)(ab + 700 * MB);
+    mtl_sub_begin(); id<MTLBuffer> m2 = gmem_map(); finish();
+    CHECK("alias pool: the table is rebuilt when the reach grows", m2 != m1);
+    CHECK("alias pool: its entry grew to the new reach", g_pools[g_big[0].full - 1].end == ab + 704 * MB);
+    CHECK("alias pool: the grown table covers what was mapped since", covered(m2, ab + 650 * MB) && !covered(m2, ab + 800 * MB));
+    mtl_pool_del(al); mtl_drain();
+    CHECK("alias pool: removed with all its entries", g_nbig == 0 && g_npool == pools0);
+    g_alias_lo = g_alias_hi = g_alias_end = 0;
     printf("t_pool_chunks: %d checks, %d failed\n", checks, failed); return failed != 0;
 }}

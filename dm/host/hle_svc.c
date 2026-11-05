@@ -107,6 +107,10 @@ static size_t big_bss_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i+
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
+static _Atomic uint64_t g_alias_reach;   // the end (region-relative) of the highest alias page ever opened by MapPhysicalMemory; only grows
+// Where the alias region is and how far into it the game has ever mapped, as an address: pages past it were never opened (they are inaccessible, and a read of one is a fault on the console), so the GPU's pool table for raw global
+// memory need not cover them (nvn_mtl.m big_cover). 0 before mem_init
+uintptr_t svc_alias_reach(uintptr_t *lo, uintptr_t *hi) { *lo = (uintptr_t)g_alias; *hi = (uintptr_t)g_alias + g_alias_cap; return g_alias ? (uintptr_t)g_alias + atomic_load(&g_alias_reach) : 0; }
 void svc_alias_range(uint8_t **base, size_t *size) { *base = g_alias; *size = g_alias_cap; }   // the alias region (GetInfo's), NULL before mem_init
 
 enum { I_CoreMask=0, I_PriorityMask=1, I_AliasAddr=2, I_AliasSize=3, I_HeapAddr=4, I_HeapSize=5,
@@ -632,6 +636,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // only decommit can invalidate backing required for eventual copyback.
         if (num == 0x2D && map_source_busy(a, size)) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0; }
         uint64_t off = a - (uintptr_t)g_alias;
+        if (num == 0x2C) { uint64_t r = atomic_load(&g_alias_reach); while (off + size > r && !atomic_compare_exchange_weak(&g_alias_reach, &r, off + size)) {} }   // before the pages open: a table built meanwhile covers them
         int64_t need = alias_unmapped(off, size) * 4096;
         // Profile mem_map_limit: a map that would take the process past the application pool fails with ResultLimitReached, as on Horizon (the pool less the used memory GetInfo reports).
         // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped

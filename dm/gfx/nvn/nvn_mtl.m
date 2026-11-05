@@ -570,10 +570,23 @@ static void pool_res(int i) {
 // Trace) with 140 MB free, and frames took 100 ms and more every few frames. A pool of BIG_MIN or more therefore has no buffer of its own: a lookup gets a chunk, a zero-copy buffer over the BIG_S
 // stride holding its address and on up to the end of what it asked (rounded up to the stride, plus a stride), made when first asked for. Only what lookups reach is wired. The chunks overlap, as adjacent
 // pools' buffers do at shared pages; GPU addresses are not contiguous across them, so a lookup must say how far it reads. One that does not know (length 1: an indirect draw's index buffer, a raw storage
-// address) gets BIG_UNKNOWN past its address. Raw global memory, whose pool table the shader walks by itself, takes the whole pool: big_full
+// address) gets BIG_UNKNOWN past its address. Raw global memory, whose pool table the shader walks by itself, takes the pool whole (big_cover: a pool that is the alias region, only as far as the game has ever mapped it): big_full
 enum { BIG_MIN = 512u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 32 };
 typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; NSMutableArray *old; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1; old: buffers a longer chunk replaced, alive with the pool
 static big_pool g_big[BIG_MAX]; static int g_nbig;
+// How far a large pool's buffer for raw global memory must reach. Metal charges and wires a zero-copy buffer by its whole length, mapped or not: Ocarina of Time's 2,432 MB graphics pool is the alias region, of which the game
+// has mapped about 2 GB by gameplay, and with the 5.8 GB of buffers the pool table made resident the iPhone's 8,192 MB working set was passed. Pages of the alias region the game has never opened are inaccessible, and a read
+// of one faults on the console, so a pool that lies within the region is covered up to the highest page the game ever opened (hle_svc.c svc_alias_reach, only grows), rounded up to a step so the table is not rebuilt for each
+// map. Any other pool, or no alias region: all of it. What lies past is still reached by lookups, in chunks
+uintptr_t svc_alias_reach(uintptr_t *lo, uintptr_t *hi);
+enum { BIG_REACH_STEP = 64u << 20 };
+static uintptr_t big_reach(void) { uintptr_t lo, hi, r = svc_alias_reach(&lo, &hi); return r ? (r + BIG_REACH_STEP - 1) & ~(uintptr_t)(BIG_REACH_STEP - 1) : 0; }
+static uintptr_t big_cover(const big_pool *b) {
+    uintptr_t lo, hi, r = big_reach(); (void)svc_alias_reach(&lo, &hi);
+    if (!r || b->a < lo || b->b > hi) return b->b;
+    r = MAX(r, b->a + BIG_S);
+    return MIN(r, b->b);
+}
 static int big_of(uint64_t addr) { for (int i = 0; i < g_nbig; i++) if (addr >= g_big[i].lo && addr < g_big[i].hi) return i; return -1; }
 void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
@@ -665,7 +678,7 @@ static int big_new(big_pool *b, uintptr_t lo, uintptr_t hi, uintptr_t end, uint6
 // The entry of a large pool for [addr, addr + len): the chunk of its stride, made or lengthened to reach as far as asked; -1 past the pool's end
 static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     if (addr + len > b->hi) return -1;
-    if (b->full) return b->full - 1;
+    if (b->full && addr + len <= g_pools[b->full - 1].end) return b->full - 1;
     uintptr_t k = (addr - b->a) >> 24, lo = b->a + (k << 24);
     uint64_t want = len > 1 ? len : BIG_UNKNOWN; uintptr_t end = (addr + want + BIG_S - 1) & ~(uintptr_t)(BIG_S - 1); end += BIG_S; if (end > b->b || end < lo) end = b->b;
     int i = b->chunk[k] - 1;
@@ -8177,18 +8190,24 @@ static uint64_t support_gpu(void) { static uint64_t gpu; if (!gpu) gpu = support
 // vertex shader writes {count 0, instances 1} into each indirect draw record whose address its storage buffer lists, every frame before the terrain's culling refills them; with the
 // stores dropped, the terrain's walls and floor were never drawn (instance count 0) and the counts grew frame after frame.
 // Layout (dmsh_abi.h DMSH_GMEM_MAP_*): sorted by start, entry 0 empty, then the pools as disjoint ranges (a pool overlapping an earlier one keeps only its part past that one's end: every
-// pool wraps the guest's own pages, so any pool holding an address gives its GPU address), unused entries starting at ~0. Rebuilt when the pools change; the replaced table goes through
+// pool wraps the guest's own pages, so any pool holding an address gives its GPU address), unused entries starting at ~0. Rebuilt when the pools change, or when the alias region's mapped reach passes a step while a large pool is held; the replaced table goes through
 // deferred release, so submissions encoded with it keep it. Every pool is made resident, as the shader may reach any of them
-static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen;
+static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen; static uintptr_t g_gmem_reach;
 static id<MTLBuffer> gmem_map(void) {
-    uint64_t gen = atomic_load(&g_pool_gen);
-    if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf;
+    uint64_t gen = atomic_load(&g_pool_gen); uintptr_t reach = big_reach();   // taken before the table is built: the build sees at least this much
+    if (g_gmem_buf && g_gmem_gen == gen && (g_gmem_reach == reach || !g_nbig)) return g_gmem_buf;
     id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
     for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     int n = 1, over = 0; uint64_t end = 0;
     pthread_mutex_lock(&g_mu);
-    for (int k = 0; k < g_nbig; k++) if (!g_big[k].full) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
+    for (int k = 0; k < g_nbig; k++) {   // the pool table reaches a large pool as far as big_cover says; a longer entry replaces the shorter, which goes through deferred release (it would stay resident otherwise)
+        big_pool *bp = &g_big[k]; uintptr_t want = big_cover(bp);
+        if (bp->full && g_pools[bp->full - 1].end >= want) continue;
+        int f = big_new(bp, bp->a, want, want, 0); if (f < 0) continue;
+        if (bp->full) { @autoreleasepool { int i = bp->full - 1; id<MTLBuffer> ob = g_pools[i].buf; [g_keep removeObject:ob]; defer_obj_release(ob); if (g_pools[i].res) g_pool_res_n--; g_pools[i] = g_pools[f]; g_npool--; f = i; } }
+        bp->full = f + 1;
+    }
     gen = atomic_load(&g_pool_gen); pidx_sort();
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
@@ -8214,7 +8233,7 @@ static id<MTLBuffer> gmem_map(void) {
     if (over) RED_ONCE(140, "raw global memory: %d more memory pools than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
     res_add(b); res_commit();
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
-    g_gmem_buf = b; g_gmem_gen = gen;
+    g_gmem_buf = b; g_gmem_gen = gen; g_gmem_reach = reach;
     { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges (pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, (unsigned long long)gen); }
     return b;
 }
