@@ -21,6 +21,8 @@
 #define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
 static size_t g_reserve;           // its size: RESERVE, or more with a DM_ALIAS_SIZE alias region
+static int g_guest_file_backed;    // the guest address space came from a shared file mapping (DM_GUEST_FILE_BACKED): its inactive pages live in the file's cache, not the process's budget (nvn_dirty_release reads it)
+int dm_guest_file_backed(void) { return g_guest_file_backed; }
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
 int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintptr_t)g_heap; size_t cur = g_heap_cur; return g_heap && a >= b && n <= cur && a - b <= cur - n; }
@@ -58,6 +60,7 @@ static void mem_init_once(void) {
     // live guest pages. It may increase I/O latency and is not a default policy.
     const char *file_backed = getenv("DM_GUEST_FILE_BACKED");
     if (file_backed && atoi(file_backed)) {
+        g_guest_file_backed = 1;
         const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
         struct statvfs fs;
         if (statvfs(tmp, &fs) || (uint64_t)fs.f_bavail * fs.f_frsize < (uint64_t)g_reserve + (512ull << 20))
