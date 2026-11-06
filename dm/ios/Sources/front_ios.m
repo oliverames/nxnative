@@ -50,7 +50,11 @@ static UILabel *front_ios_fps_label(void);
     dm_hdr_configure_layer((__bridge void *)self.layer, s.potentialEDRHeadroom);
     if (dm_hdr_requested()) LOG("front end: iOS HDR requested, potential EDR headroom %.2f, current %.2f, drawable format %lu",
         (double)s.potentialEDRHeadroom, (double)s.currentEDRHeadroom, (unsigned long)((CAMetalLayer *)self.layer).pixelFormat);
-    self.layer.contentsScale = s.nativeScale; [self setNeedsLayout];
+    // The TV path caps its drawable at 1080p for the same reason; on a foldable's 4K-class
+    // built-in panel the game's own window textures follow the native window's bounds, so an
+    // uncapped 4K drawable makes the game construct 4K swap textures and the present costs
+    // 4K pixels a frame whatever the game draws. Phones narrower than 1080p keep their scale.
+    self.layer.contentsScale = MIN(s.nativeScale, 1920.0 / MAX(s.bounds.size.width, 1)); [self setNeedsLayout];
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
