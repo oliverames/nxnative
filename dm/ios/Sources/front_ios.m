@@ -6,6 +6,7 @@
 #import <UserNotifications/UserNotifications.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <stdatomic.h>
+#include <sys/utsname.h>
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
@@ -75,6 +76,19 @@ static CAMetalLayer *g_edr_layer;
 // times a second on the main thread, so it follows the picture to a TV (tv_attach)
 static _Atomic int g_hdr_screen = -1;
 int front_hdr_screen(void) { return atomic_load(&g_hdr_screen) != 0; }
+// The display's own peak HDR brightness (nits) from Apple's published specs by hardware model, so the status query tells the game the screen it has instead of a fixed 1,000 nits: 1,600 for the
+// iPhone 12 Pro and later (machine iPhone13,x on) and the M-series iPad XDR panels, 1,200 for the iPhone 10 and 11 (iPhone11,x and iPhone12,x). A model the table does not know answers 0 (unknown: 1,000).
+// DM_HDR_PEAK, set in the launcher or Documents/env.txt, overrides it
+unsigned front_hdr_device_peak(void) {
+    static unsigned peak; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct utsname un; uname(&un); NSString *model = un.machine[0] ? [NSString stringWithUTF8String:un.machine] : @"";
+        if ([model hasPrefix:@"iPhone"] && model.length > 6) { NSInteger gen = [[model substringFromIndex:6] integerValue]; peak = gen >= 13 ? 1600 : gen >= 11 ? 1200 : 0; }
+        else if ([model hasPrefix:@"iPad14"] || [model hasPrefix:@"iPad16"]) peak = 1600;
+        if (peak) LOG("front end: device HDR peak %u nits (%s)", peak, un.machine);
+    });
+    return peak;
+}
 static void front_ios_hdr_screen_read(void) {
     UIScreen *s = ((UIView *)g_edr_layer.delegate).window.windowScene.screen ?: g_edr_screen;   // the game view's own screen (a TV after tv_attach)
     if (!s) return;   // no screen yet: unknown
