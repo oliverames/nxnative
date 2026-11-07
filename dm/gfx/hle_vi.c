@@ -150,6 +150,7 @@ static int vi_hdr_on(void) { return dm_hdr_mode() && dm_sdk_ounce(); }
 // Whether the window's screen can show EDR (its potential headroom is above 1): the front end reads it before the guest starts and whenever the window's screen changes (front_mac.m, front_ios.m).
 // No front end (a windowless run): taken as yes, so DM_HDR alone decides
 __attribute__((weak)) int front_hdr_screen(void) { return 1; }
+__attribute__((weak)) unsigned front_hdr_device_peak(void) { return 0; }   // front_ios.m: the display's peak by hardware model; 0 = unknown (the Mac, graphics unit tests)
 // The game's declared extended luminance range in nits, for the HDR layer's HDR10 metadata (front_mac.m and front_ios.m): Core Animation maps the picture into the screen's headroom by it; none without a front end
 __attribute__((weak)) void front_hdr_content_range(unsigned lo, unsigned hi) { (void)lo; (void)hi; }
 // The paper white in nits, read once (the present and the front ends take it from here too; nvn_mtl.m present_paper_white): a number from 1 to 65535, else 203
@@ -170,7 +171,8 @@ HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7Di
     if (!mode && !atomic_load(&g_vi_hdr_live)) { if (on) *on = 0; if (fmt) *fmt = 0; if (peak) *peak = 0; return RES_OK; }   // off from the start: SDR, not logged
     // DM_HDR=2 answers HDR whatever the screen: on a screen without headroom Core Animation maps the HDR picture down instead of the game drawing its own SDR one (on Mario Kart World, more saturated than its SDR)
     int forced = mode == 2, hdr = mode && (forced || front_hdr_screen() != 0);
-    uint32_t p = vi_env_u32("DM_HDR_PEAK", 1000);
+    uint32_t p = vi_env_u32("DM_HDR_PEAK", 0);   // 0 or unset: the display's own peak by model (front_hdr_device_peak), else 1,000
+    if (!p) { unsigned d = front_hdr_device_peak(); p = d ? d : 1000; }
     // Logged when the answer changes, and at the 1st, 2nd, 10th, 100th and 1000th query: whether the game asks again (and so can follow the window to another screen)
     static atomic_int queries, last = -1;
     int n = atomic_fetch_add(&queries, 1) + 1, was = atomic_exchange(&last, hdr);

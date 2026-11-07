@@ -23,6 +23,7 @@ int front_screen_variable_refresh(void);
 // HDR output (DM_HDR=1; front_mac.m, front_ios.m): whether the window's screen can show EDR at all (its potential headroom is above 1: hle_vi.c answers HDR only then), and the
 // game's declared extended luminance range in nits, for the layer's HDR10 metadata. hle_vi.c has weak defaults for runs without a front end
 int front_hdr_screen(void);
+unsigned front_hdr_device_peak(void);   // the display's own peak HDR brightness in nits by hardware model (front_ios.m); 0 = unknown, the status query then answers 1,000
 void front_hdr_content_range(unsigned lo, unsigned hi);
 float dm_hdr_paper_white(void);   // hle_vi.c: the paper white in nits (DM_HDR_PAPER_WHITE, default 203), the luminance the picture's SDR white has
 int dm_hdr_mode(void);            // hle_vi.c: the HDR mode, 0 off, 1 by the screen, 2 on any screen (DM_HDR at start)
