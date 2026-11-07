@@ -117,6 +117,8 @@ Current, 2026-11-03: an isolated iOS build defaults to handheld mode and request
 
 The guest's fixed heap and virtual reservations are preserved. iOS uses 32 MiB upload batches ([mechanism and fixture](../../../docs/reference/memory.md#upload-staging-grows-within-one-rendering-submission)). `memory-budget.tsv` in Documents records footprint, available memory, their sum, peak footprint and graphics ledger every second from preload. No Metal device is initialized by this monitor. The TSV and `log.txt` are needed to establish the actual MKW high-water mark on the phone. No arbitrary guest-page discard or host swap mechanism is enabled. Fitting the device budget, frame pacing and gameplay remain unverified on iOS.
 
+HDR peak by device (2026-11-07, an iPhone 19,4): the game is told the phone's own peak (1,600 nits for the iPhone 12 Pro and later, `front_ios.m`) instead of a fixed 1,000 in `QueryDisplayHdrStatus`, and the layer metadata carries the same value (`dm_hdr_mastering_peak`, `nvn_hdr_layer.m`); `DM_HDR_EDR_MAX` (a ratio of paper white) still caps it. On the phone it looks good in a race; no comparison against the 1,000-nit value was measured, and a model absent from the table keeps 1,000.
+
 ## Open
 
 - `nvnCommandBufferShadingRateImagePalette` and `BindShadingRateImage` are not implemented (about 2,800 calls a race): the game draws at the full pixel rate. Unknown names: `nvn*CooperativeVectorMatrix*`, `nvn*PoolWriteDescriptorTableData`.
