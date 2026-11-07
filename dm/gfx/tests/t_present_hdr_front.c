@@ -3,7 +3,9 @@
 #include <string.h>
 int t_hdr_screen = 1;          // whether the window's screen can show EDR (front_hdr_screen)
 unsigned t_hdr_lo, t_hdr_hi;   // the last range the game declared (front_hdr_content_range)
+unsigned t_hdr_device_peak;    // the display's own peak by model (front_hdr_device_peak); 0 = unknown
 int front_hdr_screen(void) { return t_hdr_screen; }
+unsigned front_hdr_device_peak(void) { return t_hdr_device_peak; }
 void front_hdr_content_range(unsigned lo, unsigned hi) { t_hdr_lo = lo; t_hdr_hi = hi; }
 int dm_sdk_ounce(void) { return 1; }   // a Switch 2 game (loader.c reads the sdk module's spec)
 int dm_opmode(void) { return 0; }      // handheld (hle_vi.c's display buffer answer)

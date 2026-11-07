@@ -12,7 +12,7 @@ module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
-extern int t_hdr_screen; extern unsigned t_hdr_lo, t_hdr_hi;
+extern int t_hdr_screen; extern unsigned t_hdr_lo, t_hdr_hi, t_hdr_device_peak;
 int vi_hdr_answered(void); int dm_hdr_mode(void); void dm_hdr_set_mode(int m);
 static int checks, failed;
 #define CHECK(name, ok) do { int pass_ = !!(ok); checks++; failed += !pass_; printf("%s: %s\n", name, pass_ ? "PASS" : "FAIL"); } while (0)
@@ -117,6 +117,14 @@ int main(void) { @autoreleasepool {
         t_hdr_screen = 1; status(&on, &fmt, &peak, NULL);
         CHECK("a screen with EDR: HDR on, format 1, peak 1000", on == 1 && fmt == 1 && peak == 1000);
         CHECK("a screen with EDR: the window is taken as PQ", vi_hdr_answered() == 1);
+        t_hdr_device_peak = 1600; status(&on, &fmt, &peak, NULL);
+        CHECK("a model with a known peak: the game is told it (1600), not 1000", on == 1 && peak == 1600);
+        setenv("DM_HDR_PEAK", "900", 1); status(&on, &fmt, &peak, NULL);
+        CHECK("DM_HDR_PEAK overrides the model's peak", peak == 900);
+        setenv("DM_HDR_PEAK", "0", 1); status(&on, &fmt, &peak, NULL);
+        CHECK("DM_HDR_PEAK=0 is automatic: the model's peak again", peak == 1600);
+        unsetenv("DM_HDR_PEAK"); t_hdr_device_peak = 0; status(&on, &fmt, &peak, NULL);
+        CHECK("an unknown model without DM_HDR_PEAK: 1000", peak == 1000);
         t_hdr_screen = 0; status(&on, &fmt, &peak, NULL);
         CHECK("the window moves to a screen without EDR: SDR is answered, and the HDR window already made is still decoded", on == 0 && fmt == 0 && vi_hdr_answered() == 1);
         t_hdr_screen = 1;

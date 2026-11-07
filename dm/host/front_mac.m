@@ -35,6 +35,7 @@ static CAMetalLayer *g_layer;
 // Read four times a second on the main thread while the HDR layer is on, so it follows the window to another screen (an external SDR monitor beside the built-in XDR screen)
 static _Atomic int g_hdr_screen = -1;
 int front_hdr_screen(void) { return atomic_load(&g_hdr_screen) != 0; }
+unsigned front_hdr_device_peak(void) { return 0; }   // no model table on the Mac: DM_HDR_PEAK or 1,000
 static void front_hdr_screen_read(NSScreen *s) {
     double pot = s.maximumPotentialExtendedDynamicRangeColorComponentValue;
     int can = pot > 1.0;
