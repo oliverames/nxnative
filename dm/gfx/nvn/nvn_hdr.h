@@ -14,5 +14,8 @@ void dm_hdr_luminance(int extended, uint16_t low, uint16_t high);
 void dm_hdr_luminance_range(int extended, uint16_t *low, uint16_t *high);
 // Called on the UI thread before the guest starts, and when its screen changes.
 void dm_hdr_configure_layer(void *layer, double potential_headroom);
+// The device's own peak HDR brightness in nits (front ends publish it by the hardware model);
+// the layers' mastering metadata tops out at it when it is below the game's own peak
+void dm_hdr_peak(double peak_nits);
 // Called by the present owner; applies content metadata for following drawables.
 void dm_hdr_layer_metadata(void *layer, int hdr_content);

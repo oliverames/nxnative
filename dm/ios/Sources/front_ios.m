@@ -6,6 +6,7 @@
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
+#include <sys/utsname.h>
 #include "front.h"
 #include "nvn_hdr.h"
 #include "hle.h"
@@ -45,6 +46,22 @@ static UILabel *front_ios_fps_label(void);
     [super didMoveToWindow];
     UIScreen *s = self.window.windowScene.screen;
     if (!s) { dm_hdr_display(0); return; }
+    // The device's own peak HDR brightness (nits), from Apple's published display specs by the
+    // hardware model: the mastering metadata the layers publish tops out where the display reads,
+    // so the PQ range is calibrated to the screen instead of always 1,000 nits (the foldable's
+    // panel is of the 1,600-nit class like the Pro phones). A model this table does not know keeps
+    // the layer's own mastering peak, and DM_HDR_EDR_MAX (a ratio of paper white) still overrides.
+    struct utsname un; uname(&un);
+    const char *m = un.machine; NSString *model = m ? [NSString stringWithUTF8String:m] : @"";
+    double peak = 0;   // 0 = unknown: the layer keeps the mastering metadata it would have had
+    if ([model hasPrefix:@"iPhone"] && [model length] > 6) {
+        NSUInteger gen = [[model substringWithRange:NSMakeRange(6, [model length] - 6)] integerValue];
+        if (gen >= 12)      peak = 1600;   // 1,600 nits on the 12 Pro and later, the modern peak the user's panels read
+        else if (gen >= 10) peak = 1200;
+    } else if ([model hasPrefix:@"iPad14"]) {
+        peak = 1600;   // the M-series iPad XDR panels
+    }
+    dm_hdr_peak(peak);   // nvn_hdr_layer.m: the layers' mastering metadata peak is the model's own
     // Advertise HDR only after configuring the actual phone/TV drawable. The
     // shared present pass already decodes negotiated PQ/scRGB into this layer.
     dm_hdr_configure_layer((__bridge void *)self.layer, s.potentialEDRHeadroom);
