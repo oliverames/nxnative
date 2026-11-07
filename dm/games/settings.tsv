@@ -25,6 +25,8 @@ DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=bas
 DM_FULLSCREEN	choice	0=Window,1=Fullscreen	0	platform:mac	Game	Display mode		level=basic
 DM_PICTURE_FIT	choice	fit=Fit,fill=Fill	fit	platform:ios	Game	Picture	Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
 DM_HDR	toggle	-	0	switch2	Game	HDR output
+DM_HDR_PEAK	choice	0=Automatic,600=600 nits,1000=1000 nits,1200=1200 nits,1600=1600 nits,2000=2000 nits	0	switch2	Game	HDR peak brightness	How bright the game may make its brightest highlights. Automatic uses the screen's own peak: 1600 nits on the iPhone 12 Pro and later, 1000 nits elsewhere. Untested at other values.	needs=DM_HDR=1
+DM_HDR_PAPER_WHITE	range	100:400:1	203	switch2	Game	HDR paper white	The brightness of white in nits (203 is the BT.2408 reference); the picture's highlights go above it. Untested at other values.	needs=DM_HDR=1
 DM_SHOW_FPS	toggle	-	build:DM_SHOW_FPS	platform:ios	Game	Frame-rate counter
 DM_TOUCH_HAPTICS	toggle	-	1	platform:ios	Controls	Touch feedback
 DM_RUMBLE	toggle	-	1	always	Controls	Game rumble		level=basic

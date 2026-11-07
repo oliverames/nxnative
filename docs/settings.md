@@ -3,7 +3,7 @@
 The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
-- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Movie enhancement](#movie-enhancement), [Game language](#game-language), [Picture](#picture), [HDR output](#hdr-output), [Frame-rate counter](#frame-rate-counter)
+- [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Movie enhancement](#movie-enhancement), [Game language](#game-language), [Picture](#picture), [HDR output](#hdr-output), [HDR peak brightness](#hdr-peak-brightness), [HDR paper white](#hdr-paper-white), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff), [Press a button to join](#press-a-button-to-join)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
@@ -93,6 +93,14 @@ iPhone and iPad. **Fit**, the default, shows the game's picture (16:9, or the ta
 ### HDR output
 
 Shown for Switch 2 games, on the Mac and the iPhone (measured on Donkey Kong Bananza and, to its title screen, Mario Kart World; the other Switch 2 titles are untested). **On** starts the game with its own HDR output: on a screen with HDR headroom, whites stay at the screen's normal white and the picture's highlights can go brighter above it; on a screen that cannot show HDR (most external monitors) the game is told so and shows its own SDR picture, and moving the window between screens switches it (Mario Kart World). **Off**, the default, keeps the picture as SDR. On the iPhone and iPad the in-game menu turns it on and off while the game runs (the game changes its picture within a frame or two); on the Mac it applies from the next start.
+
+### HDR peak brightness
+
+Shown for Switch 2 games once **HDR output** is on. How bright the game is told the screen can get, so it can tone-map its highlights to it. **Automatic**, the default, uses the screen's own peak by hardware model: 1,600 nits on the iPhone 12 Pro and later and the M-series iPad XDR panels, 1,200 on the iPhone X to 11, and 1,000 nits where the model is not known (the Mac). A lower value keeps highlights from getting as bright; a value above the screen's peak is mapped down by the system. Only the status the game reads and the layer's HDR10 metadata change. Measured on a physical iPhone (Mario Kart World, Automatic = 1,600: the owner reports the picture looks good); the other values are untested.
+
+### HDR paper white
+
+Shown for Switch 2 games once **HDR output** is on. The brightness of white in nits; the picture's highlights go above it. 203 nits, the BT.2408 reference, is the default. A lower value dims the whole picture's whites and leaves more headroom for highlights, a higher one the opposite. Untested at other values.
 
 ### Picture shape
 
