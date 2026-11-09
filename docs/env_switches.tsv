@@ -82,6 +82,8 @@ DM_HOME_QUIT_TEXT	switch	The texts of the Home button's quit prompt in the playe
 DM_HTML	path	Folder of the offline HTML pages (default: `html` beside the RomFS)
 DM_ICON	path	`=<image>` gives `build_ipa.sh` another app icon (default the `icon.jpg` beside the RomFS)
 DM_IMPORTS	diagnostic	When set, logs each import the loader binds to a host function and each forced takeover
+DM_ITV_LATCH	diagnostic	`=1` (off by default, effect not measured): present interval 2 is held until the game has asked for 1 continuously for `DM_ITV_LATCH_MS`, so a game that flips between 1 and 2 every few frames runs one steady 30 fps instead of alternating 16.7 and 33.3 ms periods (`present_itv` in `hle_nvn.c`).
+DM_ITV_LATCH_MS	diagnostic	`=<ms>` how long the game must ask for interval 1 before `DM_ITV_LATCH` lets go of interval 2 (default 3000).
 DM_JCMS_LOG	diagnostic	`=1` logs the game's Joy-Con mouse sensor and pointer calls (JcmsState reads, Nmouse handles, states and positions), at most once a second each
 DM_JIT_CAPTURE	path	Folder the Mac host writes what a game's `nn::jit` plugin makes to, one `<key>.jit` per request, for `dm/tools/jit_capture.py`; the NSP script sets it
 DM_JIT_LOG	diagnostic	`1` logs every `nn::jit` `GenerateCode` request
@@ -244,6 +246,7 @@ DM_PAD_IDENTICAL	switch	`0` stops reading identical pads here when GameControlle
 DM_PAD_MERGE	switch	`=1` merges every controller into player 1, as before, instead of giving each controller a player of its own (Mac and iOS)
 DM_PAD_PRESS_TO_JOIN	player	`1`: a controller is no player until one of its buttons is pressed, then it is the lowest player free, whatever its port, link or model, identical pads included (`front_mac.m`, `DmGamepad.m`, `pad_slots.h`); not with `DM_PAD_MERGE`. Launcher setting
 DM_PATCH_FRONT	switch	`=<bytes>`: the size of the patch area right before the module base for a long text (`BIG_TEXT`); set only by the rewriter's own rerun with the size it needs
+DM_PCORE	diagnostic	`=1` (off by default, effect not measured): the three busiest guest threads that have no time-constraint declaration (60 ms/s or more in the CPU sampler's 300-frame window) get a 60 Hz declaration of 1.5 times their measured per-frame CPU (1 to 6 ms), once each, to keep them on the performance cores (`pcore_declare` in `hle_thread.c`). A phone A/B has not shown an effect either way.
 DM_PHONE_MOTION	switch	On iOS, whether the phone's own device motion drives player 1's six-axis sensor: `auto` (default) while no controller supplies fresh motion, `1` phone only, `0` never; each source keeps its own orientation
 DM_PICTURE_FIT	player	`fill` scales the 16:9 picture on the iPhone and iPad until it covers the screen in landscape and crops the edges (a portrait or tabletop split and a TV stay fitted); `fit` or unset, the largest 16:9 rectangle with black bars. Launcher and in-game menu setting
 DM_PREEMPT	switch	`0` / `1` overrides the profile's `core_preempt`: also check already-runnable higher-priority peers on the caller's core after every thread SVC
@@ -312,6 +315,7 @@ DM_ROMFS	path	The game's RomFS folder, mounted read-only as `rom` (default `$DM_
 DM_ROMFS_OVERLAY	path	`=<dir>[:<dir>…]`: RomFS reads look in these folders first, in order, and fall back to `DM_ROMFS` (for a modified copy of some files)
 DM_ROOT	path	Workspace root (default `~/dm-work`): the host's and tools' default paths (RomFS, temporary storage, shader libraries under `build/cache/metal_shader_cache`, probe dumps) are under it
 DM_RT	diagnostic	`0` leaves the thread that acquires the window on its QoS only, with no Mach time-constraint policy declaring the frame deadline (on by default; for power A/B)
+DM_RT60	diagnostic	`=1` (off by default, effect not measured): the acquire thread's scheduler declaration never exceeds the base vsync period (1 / the tick rate), whatever present interval the game sets, so a game that flips its interval between 1 and 2 does not re-declare 16.7 and 33.3 ms (`rt_period_ns` in `hle_nvn.c`).
 DM_RT_COMP	switch	`=<ms>` fixes the computation the present thread's time-constraint policy declares; default `auto` re-declares it every 120 frames from that thread's per-frame CPU time (p90 and peak)
 DM_RUMBLE	player	`0` turns game rumble off (on by default); launcher setting
 DM_RUMBLE_GAIN	player	`=0..3` scales the rumble strength (default 1, `0` is silent); launcher setting

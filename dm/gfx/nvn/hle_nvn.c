@@ -1958,7 +1958,20 @@ static void present_cfg(const win_t *o) {
     LOG("[nvn] present tick %d Hz, interval mode %s (%s; present interval set by the game %d; %s)", g_hz, g_display_mode ? "display (one frame per tick, a cut)" : "game (original semantics)",
         m ? "DM_PRESENT_INTERVAL" : "game profile present_interval", o->interval, scr > 0 ? "window" : "no window");
 }
-static int present_itv(const win_t *o) { int c = fps_present_cap(), k = atomic_load(&g_fs_k); return c ? (k && fstep_on() ? k : fstep_hz() / c) : g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; }   // vsyncs per frame that presentation follows
+// DM_ITV_LATCH=1 (opt-in, not yet measured): a game that flips its present interval between 1 and 2 every few frames (Mario Kart World on an iPhone: 350 flips in 20 s around its 60 → 30 fps step, 258 in one
+// 10 s window) was shown at alternating 16.7 / 33.3 ms periods, a judder, while each flip also moved the display link and the scheduler declaration. The latch holds interval 2 until the game has
+// asked for 1 continuously for DM_ITV_LATCH_MS (3000), so the screen runs one steady 30 fps instead
+static int itv_latch_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_ITV_LATCH_MS"); v = e && atoi(e) > 0 ? atoi(e) : 3000; } return v; }
+static _Atomic uint64_t g_itv_latch_until;   // now_ns until which the interval stays >= 2 (0 = no latch)
+static int itv_latch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_ITV_LATCH"); v = e && atoi(e) != 0; if (v) LOG("[nvn] DM_ITV_LATCH=1: interval 2 is held until the game asks for 1 for %d ms", itv_latch_ms()); } return v; }
+static int present_itv(const win_t *o) {
+    int c = fps_present_cap(), k = atomic_load(&g_fs_k);
+    if (c) return k && fstep_on() ? k : fstep_hz() / c;
+    if (g_display_mode) return 1;
+    int itv = o->interval > 0 ? o->interval : 1;
+    if (itv < 2 && itv_latch_on() && now_ns() < atomic_load(&g_itv_latch_until)) return 2;
+    return itv;
+}   // vsyncs per frame that presentation follows
 // The present interval the game reads back (nvnWindowGetPresentInterval): the one it set, except in display mode, where the window presents at the interval above (1, or the cap's)
 // whatever the game set, and answering the game's own let it pace for that interval itself. Luigi's Mansion 3 (30 fps on the Switch, interval 2) reads the newest frame-history entry
 // and the interval before each present (main+0xb7a4b8): while that frame is not shown it sleeps 16.67 ms per vsync of the interval, and once shown it waits until (interval - 1)
@@ -1983,9 +1996,10 @@ static int link_wait(const win_t *o, uint64_t timeout_ns) {
 static uint64_t present_period(const win_t *o) {
     present_cfg(o);
     int was = atomic_load(&g_game_itv), want = o->interval > 0 ? o->interval : 1;
+    if (want == 2 && itv_latch_on()) atomic_store(&g_itv_latch_until, now_ns() + (uint64_t)itv_latch_ms() * 1000000ull);
     if (want != was) {
         atomic_store(&g_game_itv, want);
-        if (want < 2 || want % 2) atomic_store(&g_itv2_since, 0);   // an odd interval needs the 60 Hz link: 3 vsyncs on a 30 Hz link were 2 ticks, 15 fps for 20
+        if ((want < 2 && !(itv_latch_on() && now_ns() < atomic_load(&g_itv_latch_until))) || (want >= 2 && want % 2)) atomic_store(&g_itv2_since, 0);   // an odd interval needs the 60 Hz link: 3 vsyncs on a 30 Hz link were 2 ticks, 15 fps for 20
         else if (was < 2 || was % 2) atomic_store(&g_itv2_since, now_ns() | 1);   // | 1: the start is never 0
     }
     int itv = present_itv(o), hz = g_hz;
@@ -1994,7 +2008,17 @@ static uint64_t present_period(const win_t *o) {
 // The period the acquire thread declares to the scheduler (set_time_constraint): the present period, except that a hold the frame step raised for late frames keeps the cap's deadline.
 // Declaring the longer hold let the performance controller move the game to the efficiency cores at half the clock (TOTK on an iPhone: 3.4 → 1.5 GHz and 65% → 5% on performance
 // cores within 10 frames of a step to 30), where 60 fps no longer fits and every trial back to it fails. A step the game fixes itself (BotW's VFR override) is declared as it is
+// DM_RT60=1 (opt-in, not yet measured): the declaration always uses the base vsync period (1 / g_hz). A game that flips its own present interval between 1 and 2 (Mario Kart World after a late
+// frame: about 350 flips in 20 s on an iPhone) re-declared 16.7 / 33.3 ms at each flip, and around those flips the process left the performance cores (mean clock 3.5 → 1.6 GHz, 56% → 8%
+// on performance cores, thermal fair): the same demotion the frame-step comment above this function describes
+static int rt60_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT60"); v = e && atoi(e) != 0; if (v) LOG("[nvn] DM_RT60=1: the scheduler declaration keeps the base vsync period"); } return v; }
+static uint64_t rt_period_step(const win_t *o, uint64_t period);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
+    uint64_t r = rt_period_step(o, period);
+    if (rt60_on() && g_hz > 0 && r > 1000000000ull / (uint64_t)g_hz) r = 1000000000ull / (uint64_t)g_hz;
+    return r;
+}
+static uint64_t rt_period_step(const win_t *o, uint64_t period) {
     int c = fps_step_cap();
     if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) return period;
     int kmin = fstep_hz() / c;
