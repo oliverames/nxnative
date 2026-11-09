@@ -47,3 +47,7 @@ fps_target	60
 # ---- Graphics ----
 # agl wraps its clears in render conditions on Donkey Kong Bananza and Splatoon Raiders; the same library here, to be confirmed on this game
 render_cond	on
+
+# ---- Memory ----
+# MapPhysicalMemory refused beyond the application pool, as on Horizon (PR #1594, and PR #1383's own 1.8.0 row): the free-roam footprint stays near 4 GB
+mem_map_limit	on
