@@ -55,7 +55,12 @@ static UILabel *front_ios_fps_label(void);
     CAMetalLayer *l = (CAMetalLayer *)self.layer;
     UIScreen *screen = self.window.windowScene.screen;
     CGFloat scale = screen ? screen.nativeScale : MAX(self.traitCollection.displayScale, 1);
-    if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
+    // DM_SCREEN_MAX_WIDTH=<pixels> caps the phone's own drawable as a TV's is capped (off by default: the screen's pixels). On a foldable's 4K-class panel the game's
+    // window textures follow the drawable, so an uncapped one costs 4K pixels a present whatever the game draws (Mario Kart World on an iPhone Duo)
+    static CGFloat envMax = -1;
+    if (envMax < 0) { const char *e = getenv("DM_SCREEN_MAX_WIDTH"); envMax = e ? MAX(atof(e), 0) : 0; if (envMax > 0) fprintf(stderr, "front end: the screen's drawable is capped at %.0f pixels across (DM_SCREEN_MAX_WIDTH)\n", envMax); }
+    CGFloat cap = self.maxPixelWidth > 0 ? self.maxPixelWidth : envMax;
+    if (cap > 0) scale = MIN(scale, cap / MAX(self.bounds.size.width, 1));
     l.contentsScale = scale;
     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
 }
