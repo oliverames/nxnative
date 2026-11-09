@@ -1525,6 +1525,7 @@ __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (vo
 void mtl_res_stats(char *out, size_t n);
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full);
 extern uint32_t mtl_present_qos(void);
+__attribute__((weak)) void dm_frame_thread_qos(void) {}   // hle_thread.c: the presenting thread's QoS class; graphics unit tests have no host
 static _Atomic uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
@@ -2091,9 +2092,15 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    dm_frame_thread_qos();
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
+    if (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x3c), __ATOMIC_RELAXED) && !dm_detclock_enabled()) {   // a main that steps by the frame time (patch_nso.py FRAME_STEP, +0x38)
+        static int on = -1; static nvn_fdelta fd;
+        if (on < 0) { const char *e = getenv("DM_FRAME_DELTA"); on = !e || strcmp(e, "0"); LOG("[nvn] game step from the measured frame time: %s", on ? "on" : "off (DM_FRAME_DELTA=0)"); }
+        if (on) { float s = nvn_fdelta_next(&fd, now_ns()); uint32_t b; memcpy(&b, &s, sizeof b); __atomic_store_n((uint32_t *)(dm_fps_state + 0x38), b, __ATOMIC_RELAXED); }
+    }
     int c = fps_step_cap();
     if (dm_fps_state) { static int was; if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (dm_movie_playing() ? " (movie playing)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
     if (c) fstep_tick(o, c);

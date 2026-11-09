@@ -12,25 +12,41 @@ def frame_step(ctx):
     here, emit, fs_site, fs_put, FS_STATE_OFF, base = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state, ctx.base
     site = base + 0xe4
     fs_site(site, '2818201e')   # fdiv s8,s1,s0
-    start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
-    for w in (0xb9400211,   # ldr w17,[x16]          target fps (0 = off)
-              0x340001b1,   # cbz w17,orig (+13)
-              0xb9402211,   # ldr w17,[x16,#0x20]    step in vsyncs
-              0x34000171,   # cbz w17,orig (+11)     not decided yet
-              0x1e230220,   # ucvtf s0,w17
+    start = here()
+    ORIG, n = 21, [0]           # the original division is word 21 of the stub (checked below); n counts the words emitted
+    def put(w): emit(w); n[0] += 1
+    def cbz_w17_orig(): return 0x34000000 | (((ORIG - n[0]) & 0x7FFFF) << 5) | 17   # from this word to word ORIG
+    put(ADRP(16, here(), FS_STATE_OFF))
+    put(0xb9400211)             # ldr w17,[x16]          target fps (0 = off)
+    put(cbz_w17_orig())         # cbz w17,orig
+    put(0xb9402211)             # ldr w17,[x16,#0x20]    step in vsyncs
+    put(cbz_w17_orig())         # cbz w17,orig           not decided yet
+    for w in (0x1e230220,   # ucvtf s0,w17
               0xf9401a10,   # ldr x16,[x16,#0x30]
               0x8b110210):  # add x16,x16,x17
-        emit(w)
-    emit(ADRP(17, here(), FS_STATE_OFF))
+        put(w)
+    put(ADRP(17, here(), FS_STATE_OFF))
     for w in (0xf9001a30,   # str x16,[x17,#0x30]    vsyncs stepped
               0x1e210808,   # fmul s8,s0,s1          step × base rate
               0x52a84e10,   # mov w16,#0x42700000    60.0
               0x1e270200,   # fmov s0,w16
               0x1e201908):  # fdiv s8,s8,s0          / 60
-        emit(w)
-    emit(B(here(), site + 4))
+        put(w)
+    # Never below the measured frame time: with the hold off (DM_FPS_HOLD off) or between steps, a frame that ran long still moves the game by its real time
+    # (state +0x38, seconds, the host's mean of recent present intervals; 0 at the target; +0x3c marks a main that reads it). From PR #1543, found by gunvalk (Lichii PR #216).
+    # The cbz targets above are computed: with these words inserted, main's fixed offsets (+13, +11) landed inside this block, and an iPhone 18 Pro Max faulted at
+    # x17 + 0x3c with x17 = 0 on the first frame, before the host had decided a step. The page is taken again into x16, PR #1543's own sequence
+    put(ADRP(16, here(), FS_STATE_OFF))
+    for w in (0x52800031,   # mov w17,#1
+              0xb9003e11,   # str w17,[x16,#0x3c]    this main reads the frame time
+              0xbd403a00,   # ldr s0,[x16,#0x38]     seconds; 0 = at the target
+              0x1e210800,   # fmul s0,s0,s1          × base rate
+              0x1e204908):  # fmax s8,s8,s0
+        put(w)
+    put(B(here(), site + 4))
+    assert n[0] == ORIG, f'frame_step: the original division is word {n[0]}, the cbz branches go to word {ORIG}'
     emit(0x1e201828); emit(B(here(), site + 4))   # orig: fdiv s8,s1,s0; back
-    fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60 instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
+    fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60 (never below the measured frame time) instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
     dynamic_resolution(ctx)
 
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a

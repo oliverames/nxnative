@@ -421,6 +421,9 @@ static void res_commit(void) {
 }
 // What the residency set holds: totals by kind and the largest objects. At the first GPU out-of-memory error (the error names none of them), and for DM_CTL "restop" (hle_hid.c). The set holds
 // the game's pools (shared buffers over guest memory), textures, heaps and staging alike
+// Metal's recommended working set, or DM_NVN_WS_MB's: a smaller Mac's budget tried on a larger one (a 16 GB Mac recommends about 10.7 GB), for the shared texture retirement
+// (alias_retire_idle) and restop
+static uint64_t ws_bytes(void) { static uint64_t ws; if (!ws) { const char *e = getenv("DM_NVN_WS_MB"); ws = e && atoll(e) > 0 ? (uint64_t)atoll(e) << 20 : g_dev.recommendedMaxWorkingSetSize; } return ws; }
 static void res_top(const char *why) { @autoreleasepool {
     enum { N = 24 }; id<MTLAllocation> top[N] = {nil}; uint64_t total = 0, n = 0, kind[4] = {0}, count[4] = {0};
     pthread_mutex_lock(&g_res_mu);
@@ -429,8 +432,8 @@ static void res_top(const char *why) { @autoreleasepool {
         kind[k] += z; count[k]++;
         for (int q = 0; q < N; q++) if (!top[q] || z > top[q].allocatedSize) { for (int j = N - 1; j > q; j--) top[j] = top[j - 1]; top[q] = o; break; } }
     pthread_mutex_unlock(&g_res_mu);
-    MLOG("%s: the residency set holds %llu objects, %llu MB (Metal's recommended working set %llu MB, GPU allocated %llu MB): textures %llu, %llu MB; heaps %llu, %llu MB; shared buffers %llu, %llu MB; private buffers %llu, %llu MB; the largest:", why,
-         (unsigned long long)n, (unsigned long long)(total >> 20), (unsigned long long)(g_dev.recommendedMaxWorkingSetSize >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20),
+    MLOG("%s: the residency set holds %llu objects, %llu MB (working set %llu MB, GPU allocated %llu MB): textures %llu, %llu MB; heaps %llu, %llu MB; shared buffers %llu, %llu MB; private buffers %llu, %llu MB; the largest:", why,
+         (unsigned long long)n, (unsigned long long)(total >> 20), (unsigned long long)(ws_bytes() >> 20), (unsigned long long)(g_dev.currentAllocatedSize >> 20),
          (unsigned long long)count[0], (unsigned long long)(kind[0] >> 20), (unsigned long long)count[1], (unsigned long long)(kind[1] >> 20), (unsigned long long)count[2], (unsigned long long)(kind[2] >> 20), (unsigned long long)count[3], (unsigned long long)(kind[3] >> 20));
     for (int k = 0; k < N && top[k]; k++) { id o = top[k];
         if ([o conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = o; MLOG("  texture %lux%lux%lu format %lu levels %lu%s: %llu MB", (unsigned long)t.width, (unsigned long)t.height, (unsigned long)MAX(t.depth, t.arrayLength), (unsigned long)t.pixelFormat, (unsigned long)t.mipmapLevelCount, t.isSparse ? " (sparse)" : "", (unsigned long long)(t.allocatedSize >> 20)); }
@@ -1357,11 +1360,13 @@ void mtl_prepare(void) {
 }
 static void sub_cut_begin(void); static void ts_sub_begin(void), ts_boundary(void); static int ts_on(void);
 static void gmem_commit_patch(void);   // the raw pool table words of the arguments encoded so far follow the pools (gmem_slot_note)
+static void alias_retire_idle(void);   // shared textures nothing live resolves to any more, when memory runs short (below)
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL;
     sub_cut_begin();
     defer_drain();
     rh_trim();
+    alias_retire_idle();
     defer_reset();
     mtl_prepare();   // done by then in the submit entry; the replay tool (nvn_replay) reaches it here
     warm_claim();
@@ -2465,6 +2470,8 @@ static void count_add(nvn_hmap *m, const void *o, int d) {
 static void held_add(const void *o, int d) { count_add(&g_by_serial_held, o, d); }
 static void ghost_held_add(const void *o, int d) { count_add(&g_ghost_held, o, d); }
 static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last lookup or creation (alias_take_over spares entries looked up lately)
+static nvn_hmap g_alias_lseen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its creation or last lookup for a live texture object (alias_retire_idle)
+static nvn_hmap g_alias_gone = {.klen = sizeof(alias_key)};   // keys alias_retire_idle retired: a finalized descriptor over one resolves to nothing instead of a new texture
 // Live GPU-only image descriptions, including those not used yet. A dynamic-resolution family declares its largest image before any particular resolution is used.
 // Keeping only descriptions here lets its first allocation cover that family exactly, without allocating every resolution or rounding to a power of two.
 static nvn_hmap g_image_desc = {.klen = 8};   // serial → malloc'ed tex_t, under g_smu
@@ -2526,12 +2533,17 @@ void mtl_alias_drop_pool(const void *pool) {
     for (uint32_t j = 0; j < n; j++) {
         void *old = nvn_hm_del(&g_alias, &ks[j]);
         if (!old) continue;
-        nvn_hm_del(&g_alias_seen, &ks[j]);
+        nvn_hm_del(&g_alias_seen, &ks[j]); nvn_hm_del(&g_alias_lseen, &ks[j]);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
         defer_obj_release(o);
     }
     if (n) { g_ser_gen++; g_alias_evicted += n; }
+    for (uint32_t i = 0; i < g_alias_gone.cap;) {   // the retired keys of the pool: its storage goes with it (deletion shifts entries: examine this slot again)
+        alias_key k; if (!g_alias_gone.vals[i]) { i++; continue; }
+        memcpy(&k, g_alias_gone.keys + (size_t)i * g_alias_gone.klen, sizeof k);
+        if (k.pool == (uint64_t)(uintptr_t)pool) nvn_hm_del(&g_alias_gone, &k); else i++;
+    }
     pthread_mutex_unlock(&g_smu);
     free(ks);
     // The pool's texture IDs are marked gone before their CPU-written classification goes: a pool walk (pool_gpu, holding g_rmu) reaching an ID in between found it not gone, the
@@ -2571,12 +2583,68 @@ static void alias_take_over(const alias_key *nk) {
     for (uint32_t j = 0; j < n; j++) {
         void *old = nvn_hm_del(&g_alias, &ks[j]);
         if (!old) continue;
-        nvn_hm_del(&g_alias_seen, &ks[j]);
+        nvn_hm_del(&g_alias_seen, &ks[j]); nvn_hm_del(&g_alias_lseen, &ks[j]);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
         defer_obj_release(o);
     }
     if (n) { ser_note(0); g_alias_taken += n; }
+}
+// Shared textures no live texture object has resolved to lately are retired when GPU memory runs short (DM_NVN_ALIAS_RETIRE=0 turns it off). A game may leave the descriptors of
+// textures it finalized registered, and every texture pool walk resolves them: Ocarina of Time (Switch 2) keeps its pools for good, loads the next scene into other parts of them and
+// leaves about 12,000 such descriptors, so the scene it left kept its shared textures. After the talk with Saria 2,000 to 2,500 of them had no live object (textures 5 to 16 GB within
+// seconds), the residency set passed Metal's working set on a 24 GB Mac, and the GPU faulted, hung, or the submissions blocked in the kernel with the Mac frozen.
+// Only lookups for live objects count as use (g_alias_lseen): reclaiming by any lookup would keep every texture a stale descriptor names, and by no lookup would retire targets in use.
+// Above ALIAS_HI percent of the working set (ws_bytes) the ones no live object (or a view one holds) resolves to, idle for ALIAS_RETIRE submissions, are retired, the longest idle first,
+// until the set is down to ALIAS_LO. A finalized descriptor over a retired key then resolves to nothing (the pool table's dummy); making them again would bring the old scenes back by
+// the thousand, too new to retire. A live object over a retired key gets a new texture filled from its storage (tex_init_fill), as a texture made over storage the game wrote
+enum { ALIAS_RETIRE = 4 * ALIAS_IDLE, ALIAS_RETIRE_EVERY = ALIAS_IDLE, ALIAS_HI = 85, ALIAS_LO = 75 };
+static uint64_t g_alias_idle;   // shared textures retired as unreferenced and idle (for the memory report)
+static uint64_t ws_bytes(void);
+static void alias_retire_idle(void) {
+    static uint64_t last; uint64_t f = g_fence;
+    if (f - last < ALIAS_RETIRE_EVERY) return;
+    last = f;
+    static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_ALIAS_RETIRE"); off = e && !atoi(e); }
+    if (off) return;
+    pthread_mutex_lock(&g_res_mu); uint64_t held_bytes = g_res ? g_res.allocatedSize : 0; pthread_mutex_unlock(&g_res_mu);
+    uint64_t ws = ws_bytes(), lo_bytes = ws / 100 * ALIAS_LO;
+    if (held_bytes <= ws / 100 * ALIAS_HI) return;
+    pthread_mutex_lock(&g_smu);
+    if (!g_alias.n) { pthread_mutex_unlock(&g_smu); return; }
+    CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL);   // what live objects resolve to, and the textures those are views of (an sRGB / linear twin's view holds its shared texture)
+    for (uint32_t i = 0; i < g_by_serial.cap; i++) { void *v = g_by_serial.vals[i]; if (!v) continue;
+        CFSetAddValue(held, v);
+        id o = (__bridge id)v;
+        if ([o conformsToProtocol:@protocol(MTLTexture)]) for (id<MTLTexture> p = ((id<MTLTexture>)o).parentTexture; p; p = p.parentTexture) CFSetAddValue(held, (__bridge const void *)p);
+    }
+    typedef struct { alias_key k; uint64_t seen, bytes; } cand;
+    uint32_t n = 0, cap = 0; cand *cs = NULL;
+    for (uint32_t i = 0; i < g_alias.cap; i++) {
+        if (!g_alias.vals[i] || CFSetContainsValue(held, g_alias.vals[i])) continue;
+        alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+        uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_lseen, &k);
+        if (seen && f + 1 - seen < ALIAS_RETIRE) continue;
+        if (n == cap) { cand *nc = realloc(cs, (cap = cap ? cap * 2 : 64) * sizeof *cs); if (!nc) break; cs = nc; }
+        cs[n++] = (cand){k, seen, ((id<MTLTexture>)(__bridge id)g_alias.vals[i]).allocatedSize};
+    }
+    CFRelease(held);
+    if (n > 1) qsort_b(cs, n, sizeof *cs, ^int(const void *x, const void *y) { uint64_t a = ((const cand *)x)->seen, b = ((const cand *)y)->seen; return a < b ? -1 : a > b; });
+    uint32_t take = 0; uint64_t freed = 0;
+    for (uint32_t j = 0; j < n && held_bytes - freed > lo_bytes; j++) {   // deletion shifts entries: the keys were collected first
+        void *old = nvn_hm_del(&g_alias, &cs[j].k);
+        if (!old) continue;
+        nvn_hm_del(&g_alias_seen, &cs[j].k); nvn_hm_del(&g_alias_lseen, &cs[j].k); nvn_hm_put(&g_alias_gone, &cs[j].k, (void *)1);
+        id o = CFBridgingRelease(old);
+        if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
+        if (entry_holds((__bridge const void *)o)) defer_obj_unref(o); else defer_obj_release(o);   // a finalized serial (ghost ring) may still hold it
+        take++; freed += cs[j].bytes;
+    }
+    if (take) { g_ser_gen++; g_alias_idle += take; }
+    pthread_mutex_unlock(&g_smu);
+    free(cs);
+    if (take) { static int lines; if (lines++ < 8) MLOG("shared textures: %u retired (%llu MB), no live object resolved to them in %d submissions (residency set %llu MB of a %llu MB working set)", take,
+                 (unsigned long long)(freed >> 20), ALIAS_RETIRE, (unsigned long long)(held_bytes >> 20), (unsigned long long)(ws >> 20)); }
 }
 static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
 static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { held_add((__bridge void *)old, -1); if (alias_has(old)) defer_obj_unref(old); else defer_obj_release(old); } hm_put_id(&g_by_serial, &k, o); held_add((__bridge void *)o, 1); ser_note(k); pthread_mutex_unlock(&g_smu); }
@@ -3738,7 +3806,7 @@ static int mem_any(const uint8_t *p, uint64_t n) {   // whether any byte is non-
     for (; i < n; i++) if (p[i]) return 1;
     return 0;
 }
-static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
+static int tex_init_fill(const tex_t *t, id<MTLTexture> mt, int again) {   // again: made anew for a live object over storage whose texture alias_retire_idle retired
     if (!t->mem || !t->pool || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->has_layout) return 0;
     if (t->d.samples > 1 || ((int)mt.pixelFormat >= 250 && (int)mt.pixelFormat <= 262)) return 0;   // 250..262: Depth16Unorm … X24_Stencil8 (some names are macOS-only)
     int no_cpu = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0, uncached = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED) != 0;
@@ -3747,7 +3815,7 @@ static int tex_init_fill(const tex_t *t, id<MTLTexture> mt) {
     // and skipping the fill left all 74 of them with content 0, the screen black but for text
     if (no_cpu && (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE)) return 0;
     static int flush_fill = -1; if (flush_fill < 0) { const char *e = getenv("DM_NVN_FLUSH_FILL"); flush_fill = !e || atoi(e) != 0; }
-    if (!no_cpu && !uncached && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;
+    if (!no_cpu && !uncached && !again && (!flush_fill || !nvn_flushed(t->mem, t->L.size))) return 0;   // a retired texture made again holds what its storage holds
     if (!atomic_load(&g_sub_thread_set) || !on_sub_thread() || !mem_any(t->mem, t->L.size)) return 0;   // the upload batch belongs to the submit thread
     if (pkg_upload(t, NULL, mt, 0) != mt) return 0;
     int why = no_cpu ? 0 : uncached ? 1 : 2;
@@ -4364,7 +4432,13 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         return mt;
     }
     alias_key ak = tex_alias_key(t);
-    pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); pthread_mutex_unlock(&g_smu);
+    pthread_mutex_lock(&g_smu); __unsafe_unretained id shared = hm_get_id(&g_alias, &ak); if (shared) nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+    int live = t->serial >= (1ull << 62) || nvn_hm_get(&g_tex_live, &t->serial);
+    if (shared && live) nvn_hm_put(&g_alias_lseen, &ak, (void *)(uintptr_t)(g_fence + 1));
+    int gone = !shared && nvn_hm_get(&g_alias_gone, &ak), again = 0;
+    if (gone && live) { nvn_hm_del(&g_alias_gone, &ak); gone = 0; again = 1; }   // a live object over the storage again: made anew below, from its storage
+    pthread_mutex_unlock(&g_smu);
+    if (gone) return nil;   // a finalized descriptor over a texture alias_retire_idle retired
     if (shared) { tex_put(t->serial, shared); return shared; }
     {   // NVN textures over the same storage share its bytes. One that differs from a shared texture only by the other format of an sRGB / linear pair is a view of it: as its own Metal
         // texture, Mario Kart World's Grand Prix movie (an RGBA8 render target the YUV pass writes, sampled by the composite through an RGBA8_SRGB texture) showed a frozen frame
@@ -4389,7 +4463,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!d) return nil;
         mt = image_texture(t, d);
         if (!mt) { mt = rh_texture(t, d); if (!mt) mt = [g_dev newTextureWithDescriptor:d];
-            if (mt) { res_add(mt); if (!tex_init_fill(t, mt)) tex_zero_fill(mt); } }
+            if (mt) { res_add(mt); if (!tex_init_fill(t, mt, again)) tex_zero_fill(mt); } }
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
     }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
@@ -4401,7 +4475,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     pthread_mutex_lock(&g_smu);
     if (!g_alias_set) g_alias_set = CFSetCreateMutable(NULL, 0, NULL);
     alias_take_over(&ak);
-    hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1));
+    hm_put_id(&g_alias, &ak, mt); CFSetAddValue(g_alias_set, (__bridge const void *)mt); nvn_hm_put(&g_alias_seen, &ak, (void *)(uintptr_t)(g_fence + 1)); nvn_hm_put(&g_alias_lseen, &ak, (void *)(uintptr_t)(g_fence + 1));
     pthread_mutex_unlock(&g_smu);
     tex_put(t->serial, mt);
     return mt;
@@ -4433,7 +4507,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled render-target heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait,
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu, unreferenced and idle %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled render-target heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_alias_idle, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, nwait,
          (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20), avail);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
@@ -7978,6 +8052,7 @@ static _Atomic uint64_t g_pb_built, g_pb_archived, g_pb_reused, g_pb_spec, g_pb_
 static _Atomic uint64_t g_pt_hit_n, g_pt_hit_ns, g_pt_miss_n, g_pt_miss_ns, g_pt_spec_ns, g_pt_comp_ns, g_pt_pred_n, g_pt_pred_ns, g_pp_done_n;   // bases compiled / taken from the archive / reused, specializations, MTLDevice builds
 typedef struct { const void *vf, *ff; uint32_t samples, a2c, rast, topo, amp; uint32_t va[31][3], vl[31][3]; } pbase_key;   // what a base depends on: pso_desc's descriptor less the colour attachments
 static nvn_hmap g_pbase = {.klen = sizeof(pbase_key)};
+static _Atomic uint64_t g_pbase_epoch;   // bases put into g_pbase so far: a pipeline the archive had no base for may find one after it changes (arch_miss_known)
 // Only callers for the same base wait on this group; unrelated bases compile in parallel.
 // compiled: its owner asked the compiler (a compile 0 owner only looks in the archive, and a waiter that needs the base builds it itself when that found none).
 @interface PbaseBuild : NSObject { @public dispatch_group_t done; id<MTLRenderPipelineState> ps; NSError *error; int compiled; } @end
@@ -8538,7 +8613,7 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
         if (base || compile) g_pb_base_ns += bp_now() - t0;
         os_unfair_lock_lock(&g_pbase_lock);
         job->ps = base;
-        if (base) hm_put_id(&g_pbase, &bk, base);
+        if (base) { hm_put_id(&g_pbase, &bk, base); g_pbase_epoch++; }
         hm_rel(nvn_hm_del(&g_pbase_pending, &bk)); dispatch_group_leave(job->done);
         os_unfair_lock_unlock(&g_pbase_lock);
         if (!base) { if (compile && e) *e = job->error; return nil; }   // NOLINT(clang-analyzer-osx.cocoa.RetainCount): job stays in g_pbase_pending (hm_put_id's CFBridgingRetain) until hm_rel releases it, not a leak
@@ -8577,7 +8652,12 @@ static struct { pso_key k; id<MTLRenderPipelineState> ps; MTLRenderPipelineDescr
 static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
 static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken, g_pp_stolen;   // Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
 static void pso_predict_rest(void);
-static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
+// The table's keys → slot + 1 (with g_pp_mu held), so a lookup is one hash probe: a hybrid draw looked its pipeline up here up to three times, each a walk of all
+// PSO_PEND_MAX slots, on every draw of every frame while its build waited (Ocarina of Time's Castle Town: ~200 such draws a frame with the table full). g_pp_rel counts
+// the slots let go, so a demand into a full table with nothing finished or freed since the last full walk is refused without walking it again (pso_pend_slot)
+static nvn_hmap g_pp_idx = {.klen = sizeof(pso_key)}; static uint64_t g_pp_rel;
+static int pso_pend_find(const pso_key *k) { void *v = nvn_hm_get(&g_pp_idx, k); return v ? (int)(uintptr_t)v - 1 : -1; }
+static void pso_pend_free(int at) { nvn_hm_del(&g_pp_idx, &g_pp[at].k); g_pp[at].used = 0; g_pp_rel++; }
 static int hybrid_on(void);
 // The queue of the builds hybrid draws asked for (the draw has a pulling stand-in, so nothing waits for them): serial queues at utility QoS, one per two performance cores, round
 // robin. At user-initiated QoS on the global queue, a cold start's burst (777 builds on entering Zora's Domain, Breath of the Wild) ran on every core, beside the game's own threads,
@@ -8586,6 +8666,10 @@ static dispatch_queue_t pp_bg_queue(void) {
     static dispatch_queue_t q[8]; static int n; static _Atomic unsigned rr; static dispatch_once_t once;
     dispatch_once(&once, ^{ int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc < 2) pc = 2;
         n = pc / 2 > 8 ? 8 : pc / 2;
+        // At least 3: an iPhone with 2 performance cores had one queue, and Ocarina of Time's Castle Town demanded about 400 builds of about 1 s each on entering; 16 finished
+        // in 300 frames, the table (PSO_PEND_MAX) stayed full and later demands were refused. DM_PSO_BG_QUEUES=<1-8> sets the number
+        if (n < 3) n = 3;
+        { const char *ev = getenv("DM_PSO_BG_QUEUES"); int v = ev ? atoi(ev) : 0; if (v >= 1 && v <= 8) n = v; }
         for (int i = 0; i < n; i++) q[i] = dispatch_queue_create("dm.nvn.pso-bg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
     return q[atomic_fetch_add(&rr, 1) % (unsigned)n];
 }
@@ -8598,6 +8682,8 @@ static const char *const g_pw_why[5] = {"hybrid off", "merged pass or readable t
 static int pso_pend_slot(const pso_key *k, int spec, uint32_t *gen) {
     int slot = -1, reclaim = -1, active = 0;
     if (pso_pend_find(k) >= 0) return -1;
+    static uint64_t full_at = UINT64_MAX; uint64_t mark = g_pp_rel + atomic_load(&g_pp_done_n);
+    if (g_pp_idx.n >= PSO_PEND_MAX && full_at == mark) return -1;   // full, and nothing has finished or been let go since the last walk found no room
     for (int i = 0; i < PSO_PEND_MAX; i++) {
         if (!g_pp[i].used) { if (slot < 0) slot = i; }
         else if (!g_pp[i].done) active += !g_pp[i].demand;
@@ -8605,8 +8691,10 @@ static int pso_pend_slot(const pso_key *k, int spec, uint32_t *gen) {
     }
     if (spec && active >= PSO_PEND_ACTIVE) return -1;
     if (slot < 0) slot = reclaim;
-    if (slot < 0) return -1;
+    if (slot < 0) { full_at = mark; return -1; }
+    if (g_pp[slot].used) nvn_hm_del(&g_pp_idx, &g_pp[slot].k);   // a reclaimed finished entry: its key leaves the index
     g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].d = nil; g_pp[slot].done = g_pp[slot].run = 0; g_pp[slot].used = 1; g_pp[slot].demand = !spec;
+    nvn_hm_put(&g_pp_idx, k, (void *)(uintptr_t)(slot + 1));
     g_pp[slot].order = ++g_pp_kicked; *gen = ++g_pp[slot].gen;
     return slot;
 }
@@ -8643,11 +8731,11 @@ static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
     if (at >= 0 && !g_pp[at].done && !g_pp[at].run && g_pp[at].d) {
-        MTLRenderPipelineDescriptor *d = g_pp[at].d; g_pp[at].d = nil; g_pp[at].used = 0;
+        MTLRenderPipelineDescriptor *d = g_pp[at].d; g_pp[at].d = nil; pso_pend_free(at);
         pthread_mutex_unlock(&g_pp_mu);
         g_pp_stolen++; NSError *e = nil; return pso_build(d, &e);
     }
-    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
+    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; pso_pend_free(at); }
     pthread_mutex_unlock(&g_pp_mu);
     return ps;
 }
@@ -8656,7 +8744,7 @@ static int pso_pend_try(const pso_key *k, id<MTLRenderPipelineState> *out) {
     pthread_mutex_lock(&g_pp_mu);
     int at = pso_pend_find(k), st = at < 0 ? 0 : g_pp[at].done ? 2 : 1;
     *out = nil;
-    if (st == 2) { *out = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].d = nil; g_pp[at].used = 0; }
+    if (st == 2) { *out = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].d = nil; pso_pend_free(at); }
     pthread_mutex_unlock(&g_pp_mu);
     return st;
 }
@@ -8677,6 +8765,30 @@ static nvn_hmap g_pso_hy = {.klen = sizeof(pso_key)};   // pulling pipelines by 
 static int g_pso_pull;   // the pipeline pso_get_ returned reads its vertex streams through the layout block
 static _Atomic uint64_t g_hy_draws, g_hy_made, g_hy_none, g_hy_kicked, g_hy_ns;   // draws with a pulling pipeline, pulling pipelines made, misses with no pulling base ready, pulling bases built for later, time
 static NSMutableSet<NSData *> *g_hy_kick_set; static os_unfair_lock g_hy_lock = OS_UNFAIR_LOCK_INIT;
+// Pipelines whose base was neither made nor in an archive when a hybrid draw asked (submit thread). A draw of such a pipeline goes straight to its stand-in and does not
+// search the archives again: each search that finds nothing took 2-3 ms, and Ocarina of Time's Castle Town repeated it for its waiting pipelines on every draw of every frame
+// (about 90 % of the submit thread, frames of 40-90 ms) while their builds queued. The set is emptied, at most once a second, after a base is added, since a new base can
+// serve a pipeline that missed
+static nvn_hmap g_arch_miss = {.klen = sizeof(pso_key)};
+static int arch_miss_known(const pso_key *k) {
+    static uint64_t epoch, last_ns;
+    uint64_t ep = atomic_load(&g_pbase_epoch);
+    if (ep != epoch && g_arch_miss.n) { uint64_t now = bp_now(); if (now - last_ns >= 1000000000ull) { nvn_hm_clear(&g_arch_miss, NULL); epoch = ep; last_ns = now; } }
+    return nvn_hm_get(&g_arch_miss, k) != NULL;
+}
+static void arch_miss_note(const pso_key *k) { if (g_arch_miss.n < (1u << 16)) nvn_hm_put(&g_arch_miss, k, (void *)1); }
+// A pipeline a hybrid draw had to stand in for goes into pso_user.tsv when first asked for, not only once built. During play its build took 5-50 s on an iPhone 18 Pro Max
+// (2 performance cores shared with the game), about 1 s in the prepare step before the first frame; Castle Town asked for ~400 and finished ~60 a minute, and what had not
+// finished by the end of the run was never listed. Listed at once, the next start's prepare step builds every one of them. The later line from the built pipeline is a
+// duplicate, dropped at load. DM_PSO_DEMAND_RECORD=0 records only built pipelines, as before (submit thread)
+static nvn_hmap g_demand_rec = {.klen = sizeof(pso_key)};
+static void demand_record(const pso_key *k, NvShader *vs, NvShader *fs) {
+    static int on = -1; if (on < 0) { const char *ev = getenv("DM_PSO_DEMAND_RECORD"); on = !(ev && !strcmp(ev, "0")); }
+    if (!on || nvn_hm_get(&g_demand_rec, k) || g_demand_rec.n >= (1u << 16)) return;
+    nvn_hm_put(&g_demand_rec, k, (void *)1);
+    pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(k, vs, fs, 0, NULL, &sk); pso_skey_hex(&sk, shex);
+    pso_user_record("R\t%s\n", shex);
+}
 static MTLRenderPipelineDescriptor *pso_desc_pull(const pso_key *k, NvShader *vs, NvShader *fs) {   // pso_desc's pipeline with the pulling entry point and no vertex descriptor
     id<MTLFunction> pf = pull_fn(vs); if (!pf) return nil;
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0);
@@ -9020,12 +9132,14 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
         int st = pso_pend_try(&k, &ps);
         if (st == 2) took = 1;   // built in the background (nil: it failed, and is built again below for its message)
         else {
-            if (st == 0) ps = pso_build_ex(pso_desc(&k, vs, fs, nil, 0), &e, 0);   // its base made or archived: no compile
+            int known_miss = st == 0 && arch_miss_known(&k);
+            if (st == 0 && !known_miss) ps = pso_build_ex(pso_desc(&k, vs, fs, nil, 0), &e, 0);   // its base made or archived: no compile
             if (!ps) {
                 // Demand first (main's order): the draw's own pipeline is queued before the prediction admits speculative builds; with a stand-in nothing waits for it
                 __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get(&k, vs, fs);
                 if (h) {
-                    if (st == 0) pso_pend_demand(&k, vs, fs);
+                    if (st == 0) { if (!known_miss) arch_miss_note(&k); pso_pend_demand(&k, vs, fs); }
+                    demand_record(&k, vs, fs);
                     g_pso_pull = 1; g_hy_ns += bp_now() - bt;
                     if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; uint64_t t0 = bp_now(); pso_predict_rest(); g_bp_pso_ns += bp_now() - t0; }
                     return h;
