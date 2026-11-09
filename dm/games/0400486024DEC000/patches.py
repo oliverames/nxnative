@@ -60,6 +60,7 @@ def frame_step(ctx):
     emit(0x1e201828); emit(B(here(), site + 4))   # orig: fdiv s8,s1,s0; back
     fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60 (never below the measured frame time) instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
     dynamic_resolution(ctx)
+    half_rate(ctx)
 
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a
 # Priority; on v131072 levels 0..9 at 0.75..0.333 of 2048x1152, 1536x864 to 683x384). Its update (main+0x805aa0) reads the frame's GPU load (about 0.2 ms a unit) into +0x8, subtracts
@@ -99,31 +100,45 @@ def dynamic_resolution(ctx):
     fs_put(site, [B(site, start)], 'dynamic resolution level: 0 (full resolution), or with state +0x40 (DM_DYNAMIC_RESOLUTION) a climb on the load measured at each level')
     ctx.capabilities.add('DYNAMIC_RESOLUTION')
 
+# The framework's half rate, asked for by the host. Some of this game counts calcs, not time: the timeline that fires its subtitles (PlaySubtitleWithVoice trigger events) and
+# its movie player, which takes one picture a calc (the limit at the player's +0x20 is 1 for the creation argument the game passes, main+0x3b5c55c). The frame ratio above
+# moves what reads the time object by real time, so below 60 fps the two fall apart: on an iPhone at 33 fps with the player let take two pictures a calc, the opening's
+# picture kept time and "However, there was one particular boy..." came up 98 s into it, over the nightmare's castle gate; at 53 fps the narration was over by 61 s, over
+# Link asleep. The game's own answer to a frame of two vsyncs is its half rate: two calcs a drawn frame (bit 0 of the framework's +0x24f; frame_step's note), 60 calcs a second
+# at 30 fps. It asks for it once a calc from bit 0 of [ModuleSystem+0xa30]: 2 (enter) or 1 (leave) into the framework's +0x24e (main+0x650ea4..0x650eb4, v131072; the frame
+# function main+0x346c680 acts on it at the end of a pass, and while the mode is on the request is written only at the calc that is drawn). The stub ORs the host's ask into that
+# bit: state +0x44, 1 while the host holds 2 vsyncs or more under DM_FPS_HALF_RATE=1 (hle_nvn.c fstep_tick). x16 and x17 are free there (the function uses x16 only as a
+# local temporary far from the site, x17 nowhere).
+def half_rate(ctx):
+    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+    f = ctx.others.get('half rate request')
+    if f is None: return   # not found in this build (a red line from the locator): the game's own choice
+    site = f + 0x1a4
+    fs_site(site, '68324ab9')   # ldr w8,[x19,#0xa30]
+    start = here()
+    emit(0xb94a3268)                        # ldr w8,[x19,#0xa30]   the game's own flags
+    emit(ADRP(16, here(), FS_STATE_OFF))
+    emit(0xb9404610)                        # ldr w16,[x16,#0x44]   the host's ask, 0 or 1
+    emit(0x2a100108)                        # orr w8,w8,w16
+    emit(B(here(), site + 4))
+    fs_put(site, [B(site, start)], 'half rate request: the game\'s own flag or the host\'s ask (state +0x44, DM_FPS_HALF_RATE)')
+    ctx.capabilities.add('HALF_RATE')
+
 MATCH_FRAME_STEP = {'main': [
     {'name': 'frame ratio from the host\'s step', 'size': 0x9b4, 'fingerprints': ['6ae2aff5344d14568e4dbaf93455e2d8278384bf892ed6c6eca87fef98fbcd1d'], 'stub': frame_step,   # v131072 main+0x6e6be0
      'others': {'dynamic resolution': {'size': 0x294, 'fingerprints': ['7af6ceb0aedf8e0c17dc08ce17fcd6a7cba6d394a0d09e3b504c6d668dc418e7']},   # v131072 main+0x8065e0
-                'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']}}},   # main+0x805aa0
+                'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']},   # main+0x805aa0
+                'half rate request': {'size': 0x938, 'fingerprints': ['cf27987b41456695ce0447d7b711f9a4f2d6424d4f3c04744252ca2cfb47dc2c']}}},   # main+0x650d00
 ]}
 
-# Movie pictures. The movies are AV1 at 60 pictures a second (Event/Movie/*.webm, no sound track: the opening's Dm_Kokiri_0000 is 9,254 pictures, 154.2 s). The player's update
-# (main+0x3b5ca60, v131072) adds the time object's step (+0x18 × 60, the frame ratio) to a remainder and advances that many picture times, at most the player's limit (+0x20):
-# main+0x3b5cb20. Its queue (main+0x3b61ea0) pops that many decoded pictures and shows the last, so the player can skip. The limit is 1 + (the creation argument >= 2)
-# (main+0x3b5d068 / +0x3b5d084), and the game passes 1 (main+0x3b5c55c): one picture a calc at most, right at 60 calcs a second and nowhere else. Below 60 fps the movie fell
-# behind its sound, which the game's audio plays on its own: on an iPhone at 26-31 ms a frame the opening's 9,254 pictures took 262 s (35 a second), and at a 2-vsync hold a
-# movie plays at half speed (the "half-speed cutscenes" of PR #1996, which a frame ratio cannot mend: the ratio was already 2 a frame there). The cut makes the limit 2, the
-# player's own value for an argument of 2 or more (its buffers follow it, +0x50), so a movie keeps its time down to 30 fps.
-#   main+0x3b5cec0, 828 bytes: cinc w8,w28,ge → add w8,w28,#1 at +0x1c4 (w28 = 1; the flags of cmp w27,#2 are not read again)
-movie = 'movie pictures: up to 2 a calc'
-MATCH_CUTS = {'main': [
-    {'name': movie, 'size': 828, 'fingerprints': ['f61ad468b6b4e1d574fe8678f5a12dfc60e1aab71be7375142a4b48b0d73ce19'],
-     'cuts': [(452, '88b79c1a', '88070011', movie + ' (as v131072 main+0x3b5d084)')]},
-]}
-
+# Movie pictures: no cut. The movies are AV1 at 60 pictures a second (Event/Movie/*.webm, no sound track: the opening's Dm_Kokiri_0000 is 9,254 pictures, 154.2 s), and the
+# player takes one picture a calc (main+0x3b5ca60 clamps to its limit at +0x20, 1 + (the creation argument >= 2) at main+0x3b5d084; the game passes 1). A cut that made the
+# limit 2 (cinc w8,w28,ge → add w8,w28,#1) kept the picture's time at 33 fps on an iPhone (9,254 pictures in about 156 s, against 262 s) and left the subtitles behind it, which
+# count calcs as the player did: worse to watch than a movie that is slow as a whole. The half rate above keeps both in step
 BINDING = [
-    {'what': movie, 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
-     'why': "the game's own movie player takes one picture a calc at most; function-matched (MATCH_CUTS) on any build that keeps the player's constructor",
-     'checked': 'v131072 main: one function with this fingerprint; the limit, its two readers, the update that clamps to it and the queue that skips read by disassembly (2026-11-09); '
-                'the opening movie timed on an iPhone before the cut (9,254 pictures in 262 s for 154 s)'},
+    {'what': 'half rate request: the game\'s own flag or the host\'s ask', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own half-rate request, found by its function's fingerprint on any build that keeps the function; switchable (DM_FPS_HALF_RATE)",
+     'checked': 'v131072 main: one function with this fingerprint, the site, the request byte and the frame function that acts on it read by disassembly (2026-11-09)'},
     {'what': 'frame ratio from the host\'s step', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
      'why': "the game's own frame-ratio division, found by its function's fingerprint on any build that keeps the function",
      'checked': 'v131072 main: one function with this fingerprint, the site and its free registers read by disassembly (2026-11-08)'},
