@@ -2,18 +2,24 @@
 # MATCH_FRAME_STEP as described there ("Registered patches"). Patches of Nintendo SDK module builds are in dm/tools/sdk_patches.py
 from nso_asm import ADRP, B
 
-# The game's frame ratio. Once a frame the function at main+0x6e6be0 (v131072) divides its base rate (60.0, or 30.0 while bit 0 of [x21+0x24f] is set) by the int frame rate at
-# [x21+0x2c8] (fdiv s8,s1,s0 at +0xe4) and hands the result to the time object (main+0x3b4e300: ratio at +0x10, 1 / ratio at +0x14, round(60 / ratio) at +0x1c), which the game
-# steps by; the frame's own time never enters it, so a frame that takes two vsyncs at rate 60 plays at half speed. The stub gives the ratio the host's step instead: step × base / 60
-# (the division's value when the host keeps frames 60 / rate vsyncs), and counts the vsyncs stepped. Until the host has decided a step, and at fps_target 0, the division runs.
-# s0 and x16 / x17 are free there (s0 is written again on every path before it is read; the function uses neither x16 nor x17); s1 keeps the base rate.
+# The game's frame ratio. Once a frame the function at main+0x6e6be0 (v131072, ModuleSystem::moduleCalc_ by the name of its job) divides its base rate (60.0, or 30.0 while
+# bit 0 of [x21+0x24f] is set) by the int frame rate at [x21+0x2c8] (fdiv s8,s1,s0 at +0xe4) and hands the result to the time object (main+0x3b4e300: ratio at +0x10, 1 / ratio
+# at +0x14, ratio / 60 at +0x18, the step in seconds, round(60 / ratio) at +0x1c), which the game steps by; the frame's own time never enters it, so a frame that takes two
+# vsyncs at rate 60 plays at half speed. The stub gives the ratio the host's step instead: step × base / 60, and counts the vsyncs stepped. Until the host has decided a step,
+# and at fps_target 0, the division runs. s0 and x16 / x17 are free there (s0 is written again on every path before it is read; the function uses neither x16 nor x17); s1 keeps
+# the base rate and x21 the framework.
+# Why × base / 60 and not the step alone (PR #1996 read base 30 as a cutscene rate and took the step, twice the speed there): the ratio's unit is 1/60 s whatever the base
+# (the time object's +0x18 is ratio × 1/60, the constant at main+0x3e4066c). Base 30 is the framework's half rate: bit 0 of its +0x24f is that mode and bit 1 flips each pass of
+# its frame function (main+0x346c680); with both set the draw and the present return at once (main+0x2cb020, main+0x40cd20) while the calc tree runs (main+0x2cabd0). So it
+# calcs twice a drawn frame, this function among them, and each calc takes half the frame's step: 30 / 30 = 1 twice a 30 fps frame on the console, step / 2 twice here. The
+# vsyncs are counted once a drawn frame, at the calc that is drawn (bit 1 clear).
 # Lichii (a GPL emulator; only the fact was taken) found the division (its notes: main+0x6E6CC4, 60 / [x21+0x2C8])
 def frame_step(ctx):
     here, emit, fs_site, fs_put, FS_STATE_OFF, base = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state, ctx.base
     site = base + 0xe4
     fs_site(site, '2818201e')   # fdiv s8,s1,s0
     start = here()
-    ORIG, n = 21, [0]           # the original division is word 21 of the stub (checked below); n counts the words emitted
+    ORIG, COUNTED, n = 24, 13, [0]   # the original division is word 24 of the stub, the ratio starts at word 13 (both checked below); n counts the words emitted
     def put(w): emit(w); n[0] += 1
     def cbz_w17_orig(): return 0x34000000 | (((ORIG - n[0]) & 0x7FFFF) << 5) | 17   # from this word to word ORIG
     put(ADRP(16, here(), FS_STATE_OFF))
@@ -21,21 +27,27 @@ def frame_step(ctx):
     put(cbz_w17_orig())         # cbz w17,orig
     put(0xb9402211)             # ldr w17,[x16,#0x20]    step in vsyncs
     put(cbz_w17_orig())         # cbz w17,orig           not decided yet
-    for w in (0x1e230220,   # ucvtf s0,w17
-              0xf9401a10,   # ldr x16,[x16,#0x30]
+    put(0x1e230220)             # ucvtf s0,w17
+    put(0x39493eb0)             # ldrb w16,[x21,#0x24f]  the framework's half-rate bits
+    put(0x37000000 | 1 << 19 | ((COUNTED - n[0]) & 0x3FFF) << 5 | 16)   # tbnz w16,#1,ratio: the calc of a half-rate frame that is not drawn; its vsyncs are counted at the drawn one
+    put(ADRP(16, here(), FS_STATE_OFF))
+    for w in (0xf9401a10,   # ldr x16,[x16,#0x30]
               0x8b110210):  # add x16,x16,x17
         put(w)
     put(ADRP(17, here(), FS_STATE_OFF))
-    for w in (0xf9001a30,   # str x16,[x17,#0x30]    vsyncs stepped
-              0x1e210808,   # fmul s8,s0,s1          step × base rate
+    put(0xf9001a30)             # str x16,[x17,#0x30]    vsyncs stepped
+    assert n[0] == COUNTED, f'frame_step: the ratio starts at word {n[0]}, the tbnz goes to word {COUNTED}'
+    for w in (0x1e210808,   # fmul s8,s0,s1          step × base rate
               0x52a84e10,   # mov w16,#0x42700000    60.0
               0x1e270200,   # fmov s0,w16
               0x1e201908):  # fdiv s8,s8,s0          / 60
         put(w)
-    # Never below the measured frame time: with the hold off (DM_FPS_HOLD off) or between steps, a frame that ran long still moves the game by its real time
+    # Never below the measured frame time: with the hold off (DM_FPS_HOLD off) or past the longest step, a frame that ran long still moves the game by its real time
     # (state +0x38, seconds, the host's mean of recent present intervals; 0 at the target; +0x3c marks a main that reads it). From PR #1543, found by gunvalk (Lichii PR #216).
-    # The cbz targets above are computed: with these words inserted, main's fixed offsets (+13, +11) landed inside this block, and an iPhone 18 Pro Max faulted at
-    # x17 + 0x3c with x17 = 0 on the first frame, before the host had decided a step. The page is taken again into x16, PR #1543's own sequence
+    # The host takes what this adds to the step off its debt (nvn_fstep_moved), or the step paid the same time back again: 9% fast at frames of 1.8 vsyncs with the hold off.
+    # Every branch target above is computed: with these words inserted, main's fixed offsets (+13, +11) landed inside this block, and an iPhone 18 Pro Max faulted at
+    # x17 + 0x3c with x17 = 0 on the first frame, before the host had decided a step. The page is taken again into x16, PR #1543's own sequence: in rewritten code x17 does
+    # not survive a store
     put(ADRP(16, here(), FS_STATE_OFF))
     for w in (0x52800031,   # mov w17,#1
               0xb9003e11,   # str w17,[x16,#0x3c]    this main reads the frame time
@@ -93,7 +105,25 @@ MATCH_FRAME_STEP = {'main': [
                 'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']}}},   # main+0x805aa0
 ]}
 
+# Movie pictures. The movies are AV1 at 60 pictures a second (Event/Movie/*.webm, no sound track: the opening's Dm_Kokiri_0000 is 9,254 pictures, 154.2 s). The player's update
+# (main+0x3b5ca60, v131072) adds the time object's step (+0x18 × 60, the frame ratio) to a remainder and advances that many picture times, at most the player's limit (+0x20):
+# main+0x3b5cb20. Its queue (main+0x3b61ea0) pops that many decoded pictures and shows the last, so the player can skip. The limit is 1 + (the creation argument >= 2)
+# (main+0x3b5d068 / +0x3b5d084), and the game passes 1 (main+0x3b5c55c): one picture a calc at most, right at 60 calcs a second and nowhere else. Below 60 fps the movie fell
+# behind its sound, which the game's audio plays on its own: on an iPhone at 26-31 ms a frame the opening's 9,254 pictures took 262 s (35 a second), and at a 2-vsync hold a
+# movie plays at half speed (the "half-speed cutscenes" of PR #1996, which a frame ratio cannot mend: the ratio was already 2 a frame there). The cut makes the limit 2, the
+# player's own value for an argument of 2 or more (its buffers follow it, +0x50), so a movie keeps its time down to 30 fps.
+#   main+0x3b5cec0, 828 bytes: cinc w8,w28,ge → add w8,w28,#1 at +0x1c4 (w28 = 1; the flags of cmp w27,#2 are not read again)
+movie = 'movie pictures: up to 2 a calc'
+MATCH_CUTS = {'main': [
+    {'name': movie, 'size': 828, 'fingerprints': ['f61ad468b6b4e1d574fe8678f5a12dfc60e1aab71be7375142a4b48b0d73ce19'],
+     'cuts': [(452, '88b79c1a', '88070011', movie + ' (as v131072 main+0x3b5d084)')]},
+]}
+
 BINDING = [
+    {'what': movie, 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own movie player takes one picture a calc at most; function-matched (MATCH_CUTS) on any build that keeps the player's constructor",
+     'checked': 'v131072 main: one function with this fingerprint; the limit, its two readers, the update that clamps to it and the queue that skips read by disassembly (2026-11-09); '
+                'the opening movie timed on an iPhone before the cut (9,254 pictures in 262 s for 154 s)'},
     {'what': 'frame ratio from the host\'s step', 'now': 'game', 'goal': 'game', 'purpose': 'frame rate',
      'why': "the game's own frame-ratio division, found by its function's fingerprint on any build that keeps the function",
      'checked': 'v131072 main: one function with this fingerprint, the site and its free registers read by disassembly (2026-11-08)'},

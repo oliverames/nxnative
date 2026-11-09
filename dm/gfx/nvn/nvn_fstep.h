@@ -148,6 +148,16 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     return s->step;
 }
 
+// A game whose stub never steps below the measured frame time (Ocarina of Time's patches.py: the larger of the step and nvn_fdelta's mean) moved `moved` vsyncs where the
+// host handed it s->step. What it moved beyond the step is real time already made up, so the debt gives it back: left in, the next steps paid the same time again. With the hold
+// at 1 (DM_FPS_HOLD off) and frames of 1.8 vsyncs the steps went 1, 2, 2, 2, 2 under a floor of 1.8, 1.96 a frame for 1.8 of real time: 9% fast, and 17% at frames of 1.5
+// (an iPhone at 26-31 ms a frame, 2026-11-09). Once per frame, after nvn_fstep_next
+static inline void nvn_fstep_moved(nvn_fstep *s, double moved) {
+    if (moved <= s->step) return;
+    s->debt -= moved - s->step;
+    if (s->debt < -1) s->debt = -1;   // as nvn_fstep_next: ahead, at most one vsync is remembered
+}
+
 // The GPU clock follows the hold too: Breath of the Wild on an iPhone went from 14.4 to about 25 ms of GPU time a frame at hold 2 with the same 4,900 draws, the CPU still on its
 // performance cores, so its cost never fitted hold 1 again. The GPU counts as slowed (another reason for nvn_fstep_next's slow) when its time at a hold above kmin is at least
 // FSTEP_GPU_SLOW times its time at kmin and it alone does not fit k − 1 (a GPU at 3 ms of 17, 6 times its time on a loading screen, is not what holds a frame back).

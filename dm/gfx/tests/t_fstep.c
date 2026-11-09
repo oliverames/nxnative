@@ -18,6 +18,19 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
     }
 }
 
+// A game whose stub never steps below the measured frame time (Ocarina of Time): each frame moves it by the larger of the step and the mean of the last present intervals,
+// both decided at the present before. moved: the host tells the controller what the game moved (nvn_fstep_moved), as hle_nvn.c fstep_tick does
+static void run_floor(sim *m, nvn_fdelta *f, uint64_t *t, double *floor, int n, double w, int kmin, int kmax, int moved) {
+    for (int i = 0; i < n; i++) {
+        int k = m->s.k ? m->s.k : kmin, step = m->next ? m->next : kmin;
+        double shown = w > k ? w : k;
+        m->real += shown; m->game += *floor > step ? *floor : step;
+        *floor = 60.0 * nvn_fdelta_next(f, *t += (uint64_t)(shown * 1e9 / 60));
+        m->next = nvn_fstep_next(&m->s, shown, w, kmin, kmax, 0, m->slow);
+        if (moved) nvn_fstep_moved(&m->s, *floor > m->next ? *floor : m->next);
+    }
+}
+
 int main(void) {
     {   // 120 fps (hle_nvn.c fps_high): kmin 1, kmax 2, in ticks of 1/120 s. The target follows the hold, so a hold above what frames take is the game at the right speed
         sim m = {0}; m.s.per_vsync = 2;
@@ -359,6 +372,25 @@ int main(void) {
             snprintf(b, sizeof b, what[c], first_len, (unsigned long long)m.s.failed);
             check(first_len == want[c] && m.s.k == 2 && m.s.failed == 1, b);
         }
+    }
+    {   // a stub that never steps below the measured frame time: the step must not pay back what the frame time already moved
+        static const double ws[] = {1.2, 1.5, 1.8, 2.37, 3.6};
+        for (int hold = 0; hold < 2; hold++) for (unsigned i = 0; i < sizeof ws / sizeof *ws; i++) {
+            double speed[2];
+            for (int moved = 0; moved < 2; moved++) {
+                sim m = {0}; nvn_fdelta f = {0}; uint64_t t = 1000; double floor = 0;
+                run_floor(&m, &f, &t, &floor, 120, 0.5, 1, hold ? 3 : 1, moved);   // at the target first
+                double r0 = m.real, g0 = m.game;
+                run_floor(&m, &f, &t, &floor, 1800, ws[i], 1, hold ? 3 : 1, moved);
+                speed[moved] = (m.game - g0) / (m.real - r0);
+            }
+            snprintf(b, sizeof b, "frame time floor, %s, frames of %.2f vsyncs: game time %.3f of real time (%.3f when the step pays it again)", hold ? "hold on" : "hold off", ws[i], speed[1], speed[0]);
+            check(fabs(speed[1] - 1) < 0.005 && speed[0] > speed[1] - 0.001, b);
+        }
+        sim m = {0}; nvn_fdelta f = {0}; uint64_t t = 1000; double floor = 0;   // one hitch at the target: paid back by the steps, and the mean that still holds it adds at most the vsync the debt remembers
+        run_floor(&m, &f, &t, &floor, 120, 0.5, 1, 3, 1); run_floor(&m, &f, &t, &floor, 1, 3.0, 1, 3, 1); run_floor(&m, &f, &t, &floor, 120, 0.5, 1, 3, 1);
+        snprintf(b, sizeof b, "frame time floor: a 50 ms hitch at 60 fps leaves the game %.2f vsyncs ahead (debt %.2f)", m.game - m.real, m.s.debt);
+        check(m.game - m.real < 1.6 && m.game - m.real > -0.01, b);
     }
     {   // the frame time a game steps by (nvn_fdelta_next)
         nvn_fdelta f = {0}; uint64_t t = 1000; float v = 1;

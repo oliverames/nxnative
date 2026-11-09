@@ -2048,6 +2048,14 @@ static void fstep_tick(const win_t *o, int c) {
     g_fs.ramp = mtl_probe_ramp_on();
     g_fs.per_vsync = fstep_hz() / 60;
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
+    // A main that never steps below the measured frame time (state +0x3c, +0x38: Ocarina of Time's stub) moves by the larger of the two. The debt takes what that adds to the
+    // step, or the next steps pay the same time back again (nvn_fstep_moved); floor_sum is that share of the game's time, which the stub's count of vsyncs does not hold
+    static double floor_sum, floor0;
+    if (dm_fps_state && !fixed && __atomic_load_n((uint32_t *)(dm_fps_state + 0x3c), __ATOMIC_RELAXED)) {
+        uint32_t fb = __atomic_load_n((uint32_t *)(dm_fps_state + 0x38), __ATOMIC_RELAXED); float fs; memcpy(&fs, &fb, sizeof fs);
+        double moved = (double)fs * fstep_hz();
+        if (moved > n) { floor_sum += moved - n; nvn_fstep_moved(&g_fs, moved); }
+    }
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
     atomic_store(&g_fs_k, g_fs.k);
     held[g_fs.k]++; if (fixed) fixed_sum += (uint64_t)n;   // the stubs count only the host's steps
@@ -2071,10 +2079,11 @@ static void fstep_tick(const win_t *o, int c) {
         if (o->presents % 1800 == 0) { LOG("[nvn] 120 fps: held 1 / 2 ticks %llu / %llu frames, %llu late, %llu up / %llu down (%llu probes, %llu failed trials)", (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)g_fs.late, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed); memset(held, 0, sizeof held); }
     } else if (o->presents % 1800 == 0) {   // game time against real time (1.000 = normal speed; lower when a device cannot hold 20 fps or after long stalls)
         uint64_t vs = __atomic_load_n((uint64_t *)(dm_fps_state + 0x30), __ATOMIC_RELAXED) + fixed_sum, t = now_ns();
-        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
-                    (vs - v0) / 60.0, (t - t0) / 1e9, (vs - v0) / 60.0 / ((t - t0) / 1e9), (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
+        double gs = ((double)(vs - v0) + floor_sum - floor0) / 60.0;   // the vsyncs the stubs counted and what a frame time floor moved beyond them
+        if (t0) LOG("[nvn] frame step: game time %.2f s in %.2f s (%.3f of real time%s); held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %llu late, %llu vsyncs paid back, %.0f dropped, %llu up / %llu down (%llu probes, %llu failed trials)",
+                    gs, (t - t0) / 1e9, gs / ((t - t0) / 1e9), floor_sum > floor0 ? ", the frame time floor counted" : "", (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3],
                     (unsigned long long)g_fs.late, (unsigned long long)g_fs.paid, g_fs.dropped, (unsigned long long)g_fs.ups, (unsigned long long)g_fs.downs, (unsigned long long)g_fs.probes, (unsigned long long)g_fs.failed);
-        t0 = t; v0 = vs; memset(held, 0, sizeof held);
+        t0 = t; v0 = vs; floor0 = floor_sum; memset(held, 0, sizeof held);
     }
 }
 // The crop a present shows: the window's own (nvnWindowSetCrop), else the vi layer's (vi::SetLayerCrop, hle_vi.c); on the Switch both become the crop of the buffer queued to the layer.

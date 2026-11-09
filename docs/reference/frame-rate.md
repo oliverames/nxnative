@@ -28,6 +28,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate) ([issue 1375](https://github.com/seedds/nxnative/issues/1375)'s M1 Max) and [Mario Kart World](../../dm/games/0400C3F00006E000/README.md#frame-rate) (the 16 GB M1 Pro's 25-28 ms races); slow motion seen by the user on both. Lichii, a GPL emulator, named both places (facts only).
 - **Check:** see each game's note. Open: no run on a Mac slow enough to show the slow motion before and after.
 
+### A frame time floor paid back by the frame step again
+
+- **Symptom:** with the hold off (`DM_FPS_HOLD=off`) and frames between one and two vsyncs, the game runs 9 to 17% fast: speech and scripted scenes run ahead of voice and music. The log's `frame step: game time … (1.000 of real time)` shows nothing, and `vsyncs paid back` grows by thousands a minute.
+- **Cause:** Ocarina of Time's stub never steps below the measured frame time: it takes the larger of the host's step and the mean of the last present intervals (`nvn_fdelta_next`). The host's debt did not know. It counted the game as moved by the step alone and paid the rest back with steps of k + 1, which the stub took whole on top of the floor. At frames of 1.8 vsyncs and a hold of 1 the steps went 1, 2, 2, 2, 2 under a floor of 1.8: 1.96 a frame for 1.8 of real time. With the hold on it settles at a hold of 2, where step and floor agree.
+- **Fix:** `nvn_fstep_moved` (`nvn_fstep.h`): once a frame, after the step is decided, `fstep_tick` takes what the floor adds to the step off the debt (kept above -1, as a frame shorter than its step is). The steps then stay at the hold and the floor carries the frame time. The log's game time counts the floor's share (`the frame time floor counted`).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#frame-rate) on an iPhone Duo (2026-11-09): 26-31 ms frames at a hold of 1, 3,000 to 12,700 vsyncs paid back by the log.
+- **Check:** `t_fstep` (a game that steps by the larger of the two, frames of 1.2 to 3.6 vsyncs, hold off and on: game time within 0.5% of real time; without the fix 1.132, 1.166 and 1.088 at 1.2, 1.5 and 1.8 with the hold off). Not yet measured on the phone.
+
 ### A regress run stops when another app takes the key window
 
 - **Symptom:** `scripts/regress.py` reports a hang (`no frame after … s`, a state dump with every game thread waiting) in some runs of Tears of the Kingdom, baseline and candidate alike; the log's last focus line before it is `oe focus state → 2`, with no `→ 1` after it.
