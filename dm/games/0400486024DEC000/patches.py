@@ -109,10 +109,27 @@ def dynamic_resolution(ctx):
 # function main+0x346c680 acts on it at the end of a pass, and while the mode is on the request is written only at the calc that is drawn). The stub ORs the host's ask into that
 # bit: state +0x44, 1 while the host holds 2 vsyncs or more under DM_FPS_HALF_RATE=1 (hle_nvn.c fstep_tick). x16 and x17 are free there (the function uses x16 only as a
 # local temporary far from the site, x17 nowhere).
+#
+# A change of scene in the half rate. The game keeps a list of a frame's items in an object whose +0x1c818 and +0x1c820 point at the list's two buffers (0x60 and 0x50 bytes an
+# entry) and whose +0x1c828 counts them (main+0x346e00 writes the two pointers and zeroes the count; the functions that add entries take a number from the count and index the
+# buffers). The command that ends the list (main+0x3321d0, from the dispatcher at main+0x54fb8 in the calc tree) stores the count through the first pointer and flushes the
+# buffer. With the half rate in effect when the opening movie ended, that command came while the first pointer was still 0, and the game stopped on the store at address 0
+# (main+0x332260): six of six runs on an iPhone, three log lines after the decoder's end of stream, on two builds; in five runs without the half rate in effect at that moment
+# it did not, and the half rate coming on 100 to 240 presents later, inside the next scene, was survived in two of them. Why the end comes before the buffers there is not
+# established (the half rate calcs twice a drawn frame, and the object is new at the change of scene). The stub leaves the store out while the pointer is 0, as the function's
+# own exits do for its other empty states (cbz to main+0x332304). Without that function in a build the host's ask is not offered at all.
 def half_rate(ctx):
     here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
-    f = ctx.others.get('half rate request')
-    if f is None: return   # not found in this build (a red line from the locator): the game's own choice
+    f, g = ctx.others.get('half rate request'), ctx.others.get('half rate list end')
+    if f is None or g is None: return   # not both found in this build (a red line from the locator): the game's own choice, and no ask from the host
+    guard = g + 0x8c
+    fs_site(guard, '690240f9')              # ldr x9,[x19]          the list's first buffer; the next word stores the count through it
+    start = here()
+    emit(0xf9400269)                        # ldr x9,[x19]
+    emit(0xb4000049)                        # cbz x9,.+8            no buffer yet: nothing to end
+    emit(0xb9000128)                        # str w8,[x9]           the game's own store
+    emit(B(here(), guard + 8))              # back after the store
+    fs_put(guard, [B(guard, start)], 'half rate at a change of scene: the list\'s count is not stored through a buffer pointer that is still 0')
     site = f + 0x1a4
     fs_site(site, '68324ab9')   # ldr w8,[x19,#0xa30]
     start = here()
@@ -128,7 +145,8 @@ MATCH_FRAME_STEP = {'main': [
     {'name': 'frame ratio from the host\'s step', 'size': 0x9b4, 'fingerprints': ['6ae2aff5344d14568e4dbaf93455e2d8278384bf892ed6c6eca87fef98fbcd1d'], 'stub': frame_step,   # v131072 main+0x6e6be0
      'others': {'dynamic resolution': {'size': 0x294, 'fingerprints': ['7af6ceb0aedf8e0c17dc08ce17fcd6a7cba6d394a0d09e3b504c6d668dc418e7']},   # v131072 main+0x8065e0
                 'dynamic resolution update': {'size': 0xb24, 'fingerprints': ['5a423697838976baf286cffa5e2ceef0d4e037abbcd9d371e90e9e702d61b3d4']},   # main+0x805aa0
-                'half rate request': {'size': 0x938, 'fingerprints': ['cf27987b41456695ce0447d7b711f9a4f2d6424d4f3c04744252ca2cfb47dc2c']}}},   # main+0x650d00
+                'half rate request': {'size': 0x938, 'fingerprints': ['cf27987b41456695ce0447d7b711f9a4f2d6424d4f3c04744252ca2cfb47dc2c']},   # main+0x650d00
+                'half rate list end': {'size': 0x150, 'fingerprints': ['b059f7020ec67159359adc3ef792107d6eb1219023bec9c7782ad4c2855f6729']}}},   # main+0x3321d0
 ]}
 
 # Movie pictures: no cut. The movies are AV1 at 60 pictures a second (Event/Movie/*.webm, no sound track: the opening's Dm_Kokiri_0000 is 9,254 pictures, 154.2 s), and the

@@ -138,6 +138,7 @@ class FrameStep(unittest.TestCase):
 
 
 HALF_FUNC, MODULE = 0x650d00, 0x710000   # the function of the half-rate request (the site at +0x1a4) and a ModuleSystem (x19)
+LIST_FUNC, LIST = 0x3321d0, 0x720000     # the function that ends the frame's list (the guarded store at +0x8c) and the list's fields (x19: +0 the buffer pointer)
 
 
 def ask(own, host):
@@ -146,10 +147,10 @@ def ask(own, host):
     m = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
     m.mem_map(BASE, 0xa00000)
     ctx = Ctx(m)
-    ctx.others['half rate request'] = HALF_FUNC
+    ctx.others['half rate request'], ctx.others['half rate list end'] = HALF_FUNC, LIST_FUNC
     profile.half_rate(ctx)
     site = HALF_FUNC + 0x1a4
-    assert ctx.sites == {site: '68324ab9'} and 'HALF_RATE' in ctx.capabilities
+    assert ctx.sites == {site: '68324ab9', LIST_FUNC + 0x8c: '690240f9'} and 'HALF_RATE' in ctx.capabilities
     m.mem_write(BASE + site + 4, struct.pack('<3I', 0x7200011f, 0x52800028, 0x1a880508))   # the game's own words: tst w8,#1; mov w8,#1; cinc w8,w8,ne
     m.mem_write(BASE + MODULE + 0xa30, struct.pack('<I', own))
     m.mem_write(BASE + STATE + 0x44, struct.pack('<I', host))
@@ -174,6 +175,30 @@ class HalfRate(unittest.TestCase):
         ctx = Ctx(None)
         profile.half_rate(ctx)   # the locator did not find it: nothing is written
         self.assertEqual((ctx.sites, ctx.cursor, ctx.capabilities), ({}, AREA, set()))
+
+    def test_no_ask_without_the_list_guard(self):   # the request function alone: the half rate would crash at a change of scene, so the host is not offered it
+        for others in ({'half rate request': HALF_FUNC}, {'half rate list end': LIST_FUNC}):
+            ctx = Ctx(None); ctx.others.update(others)
+            profile.half_rate(ctx)
+            self.assertEqual((ctx.sites, ctx.cursor, ctx.capabilities), ({}, AREA, set()))
+
+    def test_the_lists_count_is_stored_only_through_a_buffer_that_is_there(self):
+        for buffer in (0, BASE + LIST + 0x100):
+            m = unicorn.Uc(unicorn.UC_ARCH_ARM64, unicorn.UC_MODE_ARM)
+            m.mem_map(BASE, 0xa00000)
+            ctx = Ctx(m)
+            ctx.others['half rate request'], ctx.others['half rate list end'] = HALF_FUNC, LIST_FUNC
+            profile.half_rate(ctx)
+            site = LIST_FUNC + 0x8c
+            m.mem_write(BASE + site + 4, struct.pack('<I', 0xd4200000))   # the game's own store is not reached: brk #0 in its place
+            m.mem_write(BASE + site + 8, struct.pack('<I', 0xd503201f))   # nop where the function goes on
+            m.mem_write(BASE + LIST, struct.pack('<Q', buffer))
+            m.mem_write(BASE + LIST + 0x100, struct.pack('<I', 0xdeadbeef))
+            m.reg_write(arm.UC_ARM64_REG_X19, BASE + LIST)
+            m.reg_write(arm.UC_ARM64_REG_X8, 77)
+            m.emu_start(BASE + site, BASE + site + 12, count=16)   # a fault at address 0 or the brk would raise
+            self.assertEqual(m.reg_read(arm.UC_ARM64_REG_PC), BASE + site + 12)
+            self.assertEqual(struct.unpack('<I', m.mem_read(BASE + LIST + 0x100, 4))[0], 77 if buffer else 0xdeadbeef)
 
 
 if __name__ == '__main__':
