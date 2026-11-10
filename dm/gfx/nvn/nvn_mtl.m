@@ -13213,7 +13213,8 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     }
     if (g_rescue_mode) want = 0;
     pthread_mutex_unlock(&g_pq_mu);
-    if (want && mtl_fps_target() == 30) want = 3;   // Power-saving mode: display link at 30 Hz
+    const char *power_save = getenv("DM_PRESENT_LINK_POWER_SAVE");
+    if (want && mtl_fps_target() == 30 && (!power_save || strcmp(power_save, "0"))) want = 3;   // Normally use 30 Hz callbacks for a 30 fps target
     if (want) front_screen_match(want == 3 ? 30 : want == 2 ? 120 : 60);
     // The screen's rate changed (switched by front_screen_match, or another screen): the range again, virtual ticks or none. Taken only once the link object exists, so a change
     // while its thread starts (after link_main read the rate) is not lost
