@@ -15,6 +15,12 @@ static double hdr_peak_clamp(double nits) {
     if (g_hdr_peak > 0 && nits > g_hdr_peak) return g_hdr_peak;
     return nits;
 }
+// The peak the game is told its display reaches (QueryDisplayHdrStatus): the device's own peak when the front end published one, else the virtual 1,000 nits. A game tone-maps to
+// this number, so the 1,600-nit phones were shown a 1,000-nit display; DM_HDR_EDR_MAX (a ratio of paper white) still caps it
+int dm_hdr_mastering_peak(void) {
+    double p = g_hdr_peak > 0 ? g_hdr_peak : DM_HDR_MASTERING_PEAK;
+    return (int)hdr_peak_clamp(p);
+}
 void dm_hdr_configure_layer(void *ptr, double headroom) {
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ptr;
     int requested = dm_hdr_requested();
@@ -26,7 +32,7 @@ void dm_hdr_configure_layer(void *ptr, double headroom) {
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearITUR_2020);
     layer.colorspace = cs; CGColorSpaceRelease(cs);
     layer.wantsExtendedDynamicRangeContent = YES;
-    if (!layer.EDRMetadata) layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0 maxLuminance:hdr_peak_clamp(DM_HDR_MASTERING_PEAK) opticalOutputScale:DM_HDR_LINEAR_UNIT];
+    if (!layer.EDRMetadata) layer.EDRMetadata = [CAEDRMetadata HDR10MetadataWithMinLuminance:0 maxLuminance:dm_hdr_mastering_peak() opticalOutputScale:DM_HDR_LINEAR_UNIT];
 }
 void dm_hdr_layer_metadata(void *ptr, int hdr_content) {
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ptr;

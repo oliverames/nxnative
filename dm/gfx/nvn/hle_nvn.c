@@ -1567,7 +1567,24 @@ static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y
 // Power over the window since the last summary, for the whole process: CPU energy (task_energy in nJ, Apple silicon), CPU time (100% = one core) and the share of it on performance cores,
 // wakeups per second (interrupt / out of platform idle), GPU time per second (task_gpu_utilisation), thermal state, and the guest threads that yielded most (hle_thread.c);
 // then render-target traffic per frame (attachment load / store bytes, passes that load and store everything, stores saved by DM_NVN_UNWRITTEN_DC) and guest-thread CPU by Switch priority
+// The CPU's core tiers, once: Apple renamed the tiers with the M5 (the old performance cores are "super", a new middle tier is "performance"), and the power line's "on performance
+// cores" share (task_ptime) does not say which tier that is on a given chip. Logs every tier's name and size so a run can be read against the chip it ran on
+static void log_perf_levels(void) {
+    static int done; if (done) return; done = 1;
+    int levels = 0; size_t n = sizeof levels; if (sysctlbyname("hw.nperflevels", &levels, &n, 0, 0)) { LOG("[nvn] cpu tiers: hw.nperflevels unavailable"); return; }
+    for (int i = 0; i < levels && i < 8; i++) {
+        char key[48], name[64] = "?"; int phys = 0, logi = 0; size_t sz = sizeof name; uint64_t l2 = 0, hz = 0;
+        snprintf(key, sizeof key, "hw.perflevel%d.name", i); sysctlbyname(key, name, &sz, 0, 0);
+        snprintf(key, sizeof key, "hw.perflevel%d.physicalcpu", i); sz = sizeof phys; sysctlbyname(key, &phys, &sz, 0, 0);
+        snprintf(key, sizeof key, "hw.perflevel%d.logicalcpu", i); sz = sizeof logi; sysctlbyname(key, &logi, &sz, 0, 0);
+        snprintf(key, sizeof key, "hw.perflevel%d.l2cachesize", i); sz = sizeof l2; sysctlbyname(key, &l2, &sz, 0, 0);
+        LOG("[nvn] cpu tier %d (0 = fastest): '%s', %d physical / %d logical cores, L2 %llu KiB", i, name, phys, logi, (unsigned long long)l2 / 1024); (void)hz;
+    }
+    char brand[96] = "?"; size_t bs = sizeof brand; if (sysctlbyname("hw.machine", brand, &bs, 0, 0)) snprintf(brand, sizeof brand, "?");
+    LOG("[nvn] cpu: %d tier(s) on %s; the power line's 'performance cores' share is task_ptime (Apple's own split, tier not stated)", levels, brand);
+}
 static void power_line(uint64_t frame) {
+    log_perf_levels();
     static uint64_t pt, pe, pcpu, pp, piw, ppw, pg, pf, pld, pst, pfu, pudc; static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     task_power_info_v2_data_t pw; mach_msg_type_number_t n = TASK_POWER_INFO_V2_COUNT;
     if (task_info(mach_task_self(), TASK_POWER_INFO_V2, (task_info_t)&pw, &n) != KERN_SUCCESS) return;
@@ -1840,7 +1857,20 @@ static void present_cfg(const win_t *o) {
     LOG("[nvn] present tick %d Hz, interval mode %s (%s; present interval set by the game %d; %s)", g_hz, g_display_mode ? "display (one frame per tick, a cut)" : "game (original semantics)",
         m ? "DM_PRESENT_INTERVAL" : "game profile present_interval", o->interval, scr > 0 ? "window, fixed 60 Hz" : "no window, fixed 60 Hz");
 }
-static int present_itv(const win_t *o) { int c = fps_present_cap(), k = atomic_load(&g_fs_k); return c ? (k && fstep_on() ? k : 60 / c) : g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; }   // vsyncs per frame that presentation follows
+// DM_ITV_LATCH=1: a game that flips its present interval between 1 and 2 every few frames (Mario Kart World on the iPhone: 350 flips in 20 s around its 60 -> 30 fps step, 258 in one
+// 10 s window) was shown at alternating 16.7 / 33.3 ms periods, a judder, while each flip also moved the display link and the scheduler declaration. The latch holds interval 2 until the game has
+// asked for 1 continuously for DM_ITV_LATCH_MS (3000), so the screen runs one steady 30 fps instead. Off by default until a phone A/B shows the game's own logic keeps its time
+static int itv_latch_ms(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_ITV_LATCH_MS"); v = e && atoi(e) > 0 ? atoi(e) : 3000; } return v; }
+static _Atomic uint64_t g_itv_latch_until;   // now_ns until which the interval stays >= 2 (0 = no latch)
+static int itv_latch_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_ITV_LATCH"); v = e && atoi(e) != 0; if (v) LOG("[nvn] DM_ITV_LATCH=1: interval 2 is held until the game asks for 1 for %d ms", itv_latch_ms()); } return v; }
+static int present_itv(const win_t *o) {
+    int c = fps_present_cap(), k = atomic_load(&g_fs_k);
+    if (c) return k && fstep_on() ? k : 60 / c;
+    if (g_display_mode) return 1;
+    int itv = o->interval > 0 ? o->interval : 1;
+    if (itv < 2 && itv_latch_on() && now_ns() < atomic_load(&g_itv_latch_until)) return 2;
+    return itv;
+}   // vsyncs per frame that presentation follows   // vsyncs per frame that presentation follows
 // The acquire's wait for the display link: the present interval's vsyncs (60 Hz units), or with present_interval display above 60 Hz (DM_PRESENT_HZ=120 on a 120 Hz link,
 // DM_PRESENT_LINK=2) one tick of the present rate, as many link ticks as that takes. Before, a 120 Hz link waited two ticks per frame there, and display mode never went past 60 fps
 static int link_wait(const win_t *o, uint64_t timeout_ns) {
@@ -1859,9 +1889,10 @@ static int link_wait(const win_t *o, uint64_t timeout_ns) {
 static uint64_t present_period(const win_t *o) {
     present_cfg(o);
     int was = atomic_load(&g_game_itv), want = o->interval > 0 ? o->interval : 1;
+    if (want >= 2 && itv_latch_on()) atomic_store(&g_itv_latch_until, now_ns() + (uint64_t)itv_latch_ms() * 1000000ull);
     if (want != was) {
         atomic_store(&g_game_itv, want);
-        if (want < 2) atomic_store(&g_itv2_since, 0);
+        if (want < 2 && !(itv_latch_on() && now_ns() < atomic_load(&g_itv_latch_until))) atomic_store(&g_itv2_since, 0);
         else if (was < 2) atomic_store(&g_itv2_since, now_ns() | 1);   // | 1: the start is never 0
     }
     int itv = present_itv(o), hz = g_hz;
@@ -1870,7 +1901,16 @@ static uint64_t present_period(const win_t *o) {
 // The period the acquire thread declares to the scheduler (set_time_constraint): the present period, except that a hold the frame step raised for late frames keeps the cap's deadline.
 // Declaring the longer hold let the performance controller move the game to the efficiency cores at half the clock (TOTK on an iPhone: 3.4 → 1.5 GHz and 65% → 5% on performance
 // cores within 10 frames of a step to 30), where 60 fps no longer fits and every trial back to it fails. A step the game fixes itself (BotW's VFR override) is declared as it is
+// DM_RT60=1: the scheduler declaration always uses the base vsync period. The game's own interval step (Mario Kart World 1 <-> 2) re-declared 16.7 / 33.3 ms each flip, and around
+// those flips the process left the performance cores (mean clock 3.5 -> 1.6 GHz, 56% -> 8% on performance cores, thermal fair): the same demotion the frame-step comment below describes
+static int rt60_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT60"); v = e && atoi(e) != 0; if (v) LOG("[nvn] DM_RT60=1: the scheduler declaration keeps the 60 Hz period"); } return v; }
+static uint64_t rt_period_step(const win_t *o, uint64_t period);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
+    uint64_t r = rt_period_step(o, period);
+    if (rt60_on() && g_hz > 0 && r > 1000000000ull / (uint64_t)g_hz) r = 1000000000ull / (uint64_t)g_hz;
+    return r;
+}
+static uint64_t rt_period_step(const win_t *o, uint64_t period) {
     int c = fps_step_cap();
     if (!period || !c || !fstep_on() || __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED)) return period;
     int kmin = 60 / c;
