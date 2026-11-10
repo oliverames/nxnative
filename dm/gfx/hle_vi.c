@@ -83,8 +83,8 @@ HLE_FORCE("_ZN2nn2vi8FinalizeEv", "display service shutdown; the host has no vi 
 HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", "display HDR status: EDR capability of the current host screen", Result, h_vi_HdrStatus,
           uint8_t *on, uint32_t *fmt, uint16_t *peak, const void *disp) {
     (void)disp; int enabled = dm_hdr_query();
-    if (on) *on = enabled; if (fmt) *fmt = enabled ? 1 : 0; if (peak) *peak = enabled ? DM_HDR_MASTERING_PEAK : 0;
-    static int last = -1; if (last != enabled) { LOG("vi HDR: %s, virtual peak %d nits, paper white %d nits", enabled ? "enabled (EDR display)" : "off", enabled ? DM_HDR_MASTERING_PEAK : 0, DM_HDR_PAPER_WHITE); last = enabled; }
+    if (on) *on = enabled; if (fmt) *fmt = enabled ? 1 : 0; if (peak) *peak = enabled ? (uint16_t)dm_hdr_mastering_peak() : 0;
+    static int last = -1; if (last != enabled) { LOG("vi HDR: %s, virtual peak %d nits, paper white %d nits", enabled ? "enabled (EDR display)" : "off", enabled ? dm_hdr_mastering_peak() : 0, DM_HDR_PAPER_WHITE); last = enabled; }
     return RES_OK; }
 HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "display HDR paper white: 203 nits (BT.2408)", Result, h_vi_PaperWhite, uint16_t *nits, const void *disp) {
     (void)disp; if (nits) *nits = DM_HDR_PAPER_WHITE; return RES_OK; }

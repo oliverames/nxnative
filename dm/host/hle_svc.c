@@ -63,7 +63,11 @@ static void mem_init_once(void) {
         g_guest_file_backed = 1;
         const char *tmp = getenv("TMPDIR"); if (!tmp || !*tmp) tmp = "/tmp";
         struct statvfs fs;
-        if (statvfs(tmp, &fs) || (uint64_t)fs.f_bavail * fs.f_frsize < (uint64_t)g_reserve + (512ull << 20))
+        // DM_GUEST_FILE_NOCHECK=1 (deploy, 2026-11-09): the files are sparse and f_bavail leaves out what iOS can purge (a Duo with 7 GB by f_bavail had about 105 GB
+        // with it), so a full phone failed here though the game dirties only a few GB. main counts the purgeable space itself; this tree only steps over the check
+        int st = statvfs(tmp, &fs); const char *nochk = getenv("DM_GUEST_FILE_NOCHECK");
+        LOG("[mem] guest file backing: %.1f GB free by f_bavail, %.1f GB reserved%s", st ? -1.0 : (double)fs.f_bavail * fs.f_frsize / 1e9, (double)g_reserve / 1e9, nochk && atoi(nochk) ? " (DM_GUEST_FILE_NOCHECK: not checked)" : "");
+        if (!(nochk && atoi(nochk)) && (st || (uint64_t)fs.f_bavail * fs.f_frsize < (uint64_t)g_reserve + (512ull << 20)))
             die("guest file backing: insufficient temporary storage for reservation plus 512 MiB margin");
         char path[PATH_MAX];
         int n = snprintf(path, sizeof path, "%s/dm-guest-XXXXXX", tmp);
